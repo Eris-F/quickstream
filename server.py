@@ -5,6 +5,7 @@ A barebones, reliable screen sharing application for local networks.
 """
 
 import io
+import os
 import time
 import configparser
 import logging
@@ -54,8 +55,28 @@ class ScreenCapture:
             test_sct.close()
             logging.info("Screen capture available - will stream actual screen")
         except (mss.exception.ScreenShotError, Exception) as e:
-            logging.warning(f"Screen capture not available: {e}")
-            logging.warning("Running in HEADLESS mode with test pattern")
+            session_type = os.environ.get('XDG_SESSION_TYPE', 'unknown')
+            logging.error(f"Screen capture failed: {e}")
+
+            if session_type == 'wayland' or 'wayland' in os.environ.get('WAYLAND_DISPLAY', '').lower():
+                logging.error("╔════════════════════════════════════════════════════════════════╗")
+                logging.error("║  WAYLAND DETECTED - mss library does not support Wayland!     ║")
+                logging.error("╠════════════════════════════════════════════════════════════════╣")
+                logging.error("║  To fix this, you have two options:                           ║")
+                logging.error("║                                                                ║")
+                logging.error("║  Option 1: Switch to X11 session (RECOMMENDED)                ║")
+                logging.error("║    1. Log out of KDE                                           ║")
+                logging.error("║    2. At login screen, click the session selector (gear icon) ║")
+                logging.error("║    3. Select 'Plasma (X11)' instead of 'Plasma (Wayland)'     ║")
+                logging.error("║    4. Log back in and run QuickStream again                    ║")
+                logging.error("║                                                                ║")
+                logging.error("║  Option 2: Use test pattern mode                              ║")
+                logging.error("║    QuickStream will run in HEADLESS mode with test pattern    ║")
+                logging.error("╚════════════════════════════════════════════════════════════════╝")
+            else:
+                logging.warning(f"Session type: {session_type}")
+                logging.warning("Running in HEADLESS mode with test pattern")
+
             self.headless_mode = True
 
     def _get_sct(self):

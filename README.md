@@ -157,6 +157,30 @@ QuickStream uses MJPEG (Motion JPEG) streaming:
 
 ## Troubleshooting
 
+### Wayland Not Supported (Fedora, Ubuntu 22.04+, etc.)
+
+**Problem:** You see "WAYLAND DETECTED - mss library does not support Wayland!" error.
+
+**Cause:** The `mss` library used for screen capture only works with X11, not Wayland. Modern Linux distributions (Fedora, Ubuntu 22.04+, etc.) use Wayland by default.
+
+**Solution:** Switch to an X11 session:
+
+1. Log out of your desktop session
+2. At the login screen, look for a session selector (usually a gear icon or dropdown)
+3. Select the X11 session:
+   - **KDE Plasma**: Select "Plasma (X11)"
+   - **GNOME**: Select "GNOME on Xorg" or "Ubuntu on Xorg"
+4. Log back in
+5. Run QuickStream again
+
+To verify you're on X11:
+```bash
+echo $XDG_SESSION_TYPE
+# Should output: x11
+```
+
+**Alternative:** Run in test pattern mode (no screen capture, just displays a test pattern).
+
 ### Port Already in Use
 
 If port 5000 is already in use:
