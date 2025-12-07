@@ -38,21 +38,25 @@ class ScreenCapture:
         # Use thread-local storage for mss instances (mss uses thread-local display connections)
         self._thread_local = local()
 
-        # Test if display is available
-        try:
-            test_sct = mss.mss()
-            test_sct.close()
-        except mss.exception.ScreenShotError as e:
-            logging.warning(f"Display not available: {e}")
-            logging.warning("Running in HEADLESS mode with test pattern")
-            self.headless_mode = True
-
         self.monitor = monitor
         self.quality = quality
         self.fps = fps
         self.frame_delay = 1.0 / fps
         self._stop_event = Event()
         self._frame_count = 0
+
+        # Test if screen capture actually works (not just if display exists)
+        try:
+            test_sct = mss.mss()
+            # Actually try to capture to verify it works
+            test_monitor = test_sct.monitors[1] if len(test_sct.monitors) > 1 else test_sct.monitors[0]
+            test_sct.grab(test_monitor)
+            test_sct.close()
+            logging.info("Screen capture available - will stream actual screen")
+        except (mss.exception.ScreenShotError, Exception) as e:
+            logging.warning(f"Screen capture not available: {e}")
+            logging.warning("Running in HEADLESS mode with test pattern")
+            self.headless_mode = True
 
     def _get_sct(self):
         """Get or create thread-local mss instance."""
