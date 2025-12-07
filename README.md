@@ -157,29 +157,43 @@ QuickStream uses MJPEG (Motion JPEG) streaming:
 
 ## Troubleshooting
 
-### Wayland Not Supported (Fedora, Ubuntu 22.04+, etc.)
+### Wayland Support (Fedora, Ubuntu 22.04+, etc.)
 
-**Problem:** You see "WAYLAND DETECTED - mss library does not support Wayland!" error.
+QuickStream **supports Wayland** out of the box! It automatically detects your display server and uses the appropriate capture method.
 
-**Cause:** The `mss` library used for screen capture only works with X11, not Wayland. Modern Linux distributions (Fedora, Ubuntu 22.04+, etc.) use Wayland by default.
+**Supported capture methods:**
+- **X11**: Uses `mss` library (fastest, built-in)
+- **Wayland (KDE)**: Uses `spectacle` tool
+- **Wayland (Sway/wlroots)**: Uses `grim` tool
+- **Wayland (GNOME)**: Uses `gnome-screenshot` tool
 
-**Solution:** Switch to an X11 session:
+**If you see "No compatible screenshot tool found" on Wayland:**
 
-1. Log out of your desktop session
-2. At the login screen, look for a session selector (usually a gear icon or dropdown)
-3. Select the X11 session:
-   - **KDE Plasma**: Select "Plasma (X11)"
-   - **GNOME**: Select "GNOME on Xorg" or "Ubuntu on Xorg"
-4. Log back in
-5. Run QuickStream again
+Install the appropriate tool for your desktop environment:
 
-To verify you're on X11:
+**For KDE Plasma:**
 ```bash
-echo $XDG_SESSION_TYPE
-# Should output: x11
+sudo dnf install spectacle  # Fedora
+sudo apt install kde-spectacle  # Ubuntu/Debian
 ```
 
-**Alternative:** Run in test pattern mode (no screen capture, just displays a test pattern).
+**For Sway/wlroots:**
+```bash
+sudo dnf install grim  # Fedora
+sudo apt install grim  # Ubuntu/Debian
+```
+
+**For GNOME:**
+```bash
+sudo dnf install gnome-screenshot  # Fedora
+sudo apt install gnome-screenshot  # Ubuntu/Debian
+```
+
+To verify your session type:
+```bash
+echo $XDG_SESSION_TYPE
+# Output: wayland or x11
+```
 
 ### Port Already in Use
 

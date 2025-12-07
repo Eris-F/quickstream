@@ -9,6 +9,8 @@ import os
 import time
 import configparser
 import logging
+import subprocess
+import tempfile
 from pathlib import Path
 from threading import Thread, Event, local
 
@@ -35,9 +37,10 @@ class ScreenCapture:
             quality: JPEG quality (1-100)
             fps: Target frames per second
         """
-        self.headless_mode = False
+        self.capture_method = None  # 'mss', 'grim', 'spectacle', 'gnome-screenshot', or 'headless'
         # Use thread-local storage for mss instances (mss uses thread-local display connections)
         self._thread_local = local()
+        self._temp_dir = tempfile.mkdtemp(prefix='quickstream_')
 
         self.monitor = monitor
         self.quality = quality
@@ -46,42 +49,74 @@ class ScreenCapture:
         self._stop_event = Event()
         self._frame_count = 0
 
-        # Test if screen capture actually works (not just if display exists)
+        # Detect best capture method
+        self._detect_capture_method()
+
+    def _detect_capture_method(self):
+        """Detect the best available screen capture method."""
+        # Try mss first (works on X11, fastest)
         try:
             test_sct = mss.mss()
-            # Actually try to capture to verify it works
             test_monitor = test_sct.monitors[1] if len(test_sct.monitors) > 1 else test_sct.monitors[0]
             test_sct.grab(test_monitor)
             test_sct.close()
-            logging.info("Screen capture available - will stream actual screen")
+            self.capture_method = 'mss'
+            logging.info("Using mss for screen capture (X11)")
+            return
         except (mss.exception.ScreenShotError, Exception) as e:
-            session_type = os.environ.get('XDG_SESSION_TYPE', 'unknown')
-            logging.error(f"Screen capture failed: {e}")
+            logging.warning(f"mss not available: {e}")
 
-            if session_type == 'wayland' or 'wayland' in os.environ.get('WAYLAND_DISPLAY', '').lower():
-                logging.error("╔════════════════════════════════════════════════════════════════╗")
-                logging.error("║  WAYLAND DETECTED - mss library does not support Wayland!     ║")
-                logging.error("╠════════════════════════════════════════════════════════════════╣")
-                logging.error("║  To fix this, you have two options:                           ║")
-                logging.error("║                                                                ║")
-                logging.error("║  Option 1: Switch to X11 session (RECOMMENDED)                ║")
-                logging.error("║    1. Log out of KDE                                           ║")
-                logging.error("║    2. At login screen, click the session selector (gear icon) ║")
-                logging.error("║    3. Select 'Plasma (X11)' instead of 'Plasma (Wayland)'     ║")
-                logging.error("║    4. Log back in and run QuickStream again                    ║")
-                logging.error("║                                                                ║")
-                logging.error("║  Option 2: Use test pattern mode                              ║")
-                logging.error("║    QuickStream will run in HEADLESS mode with test pattern    ║")
-                logging.error("╚════════════════════════════════════════════════════════════════╝")
-            else:
-                logging.warning(f"Session type: {session_type}")
-                logging.warning("Running in HEADLESS mode with test pattern")
+        # Try Wayland screenshot tools
+        session_type = os.environ.get('XDG_SESSION_TYPE', 'unknown')
+        if session_type == 'wayland' or 'wayland' in os.environ.get('WAYLAND_DISPLAY', '').lower():
+            logging.info("Wayland session detected, trying Wayland screenshot tools...")
 
-            self.headless_mode = True
+            # Try grim (sway/wlroots)
+            if self._try_tool(['grim', '--help'], 'grim'):
+                return
+
+            # Try spectacle (KDE)
+            if self._try_tool(['spectacle', '--help'], 'spectacle'):
+                return
+
+            # Try gnome-screenshot (GNOME)
+            if self._try_tool(['gnome-screenshot', '--help'], 'gnome-screenshot'):
+                return
+
+            logging.error("╔════════════════════════════════════════════════════════════════╗")
+            logging.error("║  WAYLAND DETECTED - No compatible screenshot tool found!      ║")
+            logging.error("╠════════════════════════════════════════════════════════════════╣")
+            logging.error("║  Please install one of the following:                         ║")
+            logging.error("║                                                                ║")
+            logging.error("║  For KDE Plasma:                                               ║")
+            logging.error("║    sudo dnf install spectacle                                  ║")
+            logging.error("║                                                                ║")
+            logging.error("║  For Sway/wlroots compositors:                                ║")
+            logging.error("║    sudo dnf install grim                                       ║")
+            logging.error("║                                                                ║")
+            logging.error("║  For GNOME:                                                    ║")
+            logging.error("║    sudo dnf install gnome-screenshot                           ║")
+            logging.error("║                                                                ║")
+            logging.error("║  Falling back to test pattern mode...                         ║")
+            logging.error("╚════════════════════════════════════════════════════════════════╝")
+
+        # Fallback to test pattern
+        self.capture_method = 'headless'
+        logging.warning("Running in HEADLESS mode with test pattern")
+
+    def _try_tool(self, test_cmd, tool_name):
+        """Try if a screenshot tool is available."""
+        try:
+            result = subprocess.run(test_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=1)
+            self.capture_method = tool_name
+            logging.info(f"Using {tool_name} for screen capture (Wayland)")
+            return True
+        except (subprocess.TimeoutExpired, FileNotFoundError, Exception):
+            return False
 
     def _get_sct(self):
         """Get or create thread-local mss instance."""
-        if self.headless_mode:
+        if self.capture_method != 'mss':
             return None
 
         if not hasattr(self._thread_local, 'sct'):
@@ -89,8 +124,8 @@ class ScreenCapture:
         return self._thread_local.sct
 
     def get_monitor(self):
-        """Get the monitor to capture."""
-        if self.headless_mode:
+        """Get the monitor to capture (for mss)."""
+        if self.capture_method != 'mss':
             return None
 
         sct = self._get_sct()
@@ -103,6 +138,44 @@ class ScreenCapture:
         else:
             # Default to primary monitor
             return sct.monitors[1]
+
+    def _capture_with_mss(self):
+        """Capture screen using mss library."""
+        sct = self._get_sct()
+        monitor = self.get_monitor()
+        screenshot = sct.grab(monitor)
+        return Image.frombytes('RGB', screenshot.size, screenshot.rgb)
+
+    def _capture_with_tool(self, tool_name):
+        """Capture screen using external tool (grim, spectacle, gnome-screenshot)."""
+        temp_file = os.path.join(self._temp_dir, f'screenshot_{self._frame_count}.png')
+
+        try:
+            if tool_name == 'grim':
+                subprocess.run(['grim', temp_file], check=True, timeout=2, capture_output=True)
+            elif tool_name == 'spectacle':
+                subprocess.run(['spectacle', '-bno', temp_file], check=True, timeout=2, capture_output=True)
+            elif tool_name == 'gnome-screenshot':
+                subprocess.run(['gnome-screenshot', '-f', temp_file], check=True, timeout=2, capture_output=True)
+
+            # Load the screenshot
+            if os.path.exists(temp_file):
+                img = Image.open(temp_file)
+                # Convert to RGB if needed
+                if img.mode != 'RGB':
+                    img = img.convert('RGB')
+                # Clean up
+                try:
+                    os.remove(temp_file)
+                except:
+                    pass
+                return img
+            else:
+                raise Exception(f"Screenshot file not created by {tool_name}")
+
+        except Exception as e:
+            logging.error(f"Error capturing with {tool_name}: {e}")
+            raise
 
     def generate_test_pattern(self):
         """
@@ -152,16 +225,18 @@ class ScreenCapture:
         Returns:
             bytes: JPEG encoded frame
         """
-        if self.headless_mode:
+        if self.capture_method == 'headless':
             # Generate test pattern in headless mode
             img = self.generate_test_pattern()
+        elif self.capture_method == 'mss':
+            # Capture with mss (X11)
+            img = self._capture_with_mss()
+        elif self.capture_method in ('grim', 'spectacle', 'gnome-screenshot'):
+            # Capture with Wayland tool
+            img = self._capture_with_tool(self.capture_method)
         else:
-            # Capture actual screen
-            sct = self._get_sct()
-            monitor = self.get_monitor()
-            screenshot = sct.grab(monitor)
-            # Convert to PIL Image
-            img = Image.frombytes('RGB', screenshot.size, screenshot.rgb)
+            # Fallback to test pattern
+            img = self.generate_test_pattern()
 
         # Encode as JPEG
         buffer = io.BytesIO()
@@ -196,6 +271,14 @@ class ScreenCapture:
         """Stop the screen capture."""
         self._stop_event.set()
         # Thread-local mss instances will be cleaned up when threads terminate
+
+        # Clean up temporary directory
+        try:
+            import shutil
+            if os.path.exists(self._temp_dir):
+                shutil.rmtree(self._temp_dir)
+        except Exception as e:
+            logging.warning(f"Failed to clean up temp directory: {e}")
 
 
 class Config:
