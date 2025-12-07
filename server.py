@@ -9,7 +9,7 @@ import time
 import configparser
 import logging
 from pathlib import Path
-from threading import Thread, Event
+from threading import Thread, Event, local
 
 try:
     import setproctitle
@@ -35,12 +35,16 @@ class ScreenCapture:
             fps: Target frames per second
         """
         self.headless_mode = False
+        # Use thread-local storage for mss instances (mss uses thread-local display connections)
+        self._thread_local = local()
+
+        # Test if display is available
         try:
-            self.sct = mss.mss()
+            test_sct = mss.mss()
+            test_sct.close()
         except mss.exception.ScreenShotError as e:
             logging.warning(f"Display not available: {e}")
             logging.warning("Running in HEADLESS mode with test pattern")
-            self.sct = None
             self.headless_mode = True
 
         self.monitor = monitor
@@ -50,20 +54,30 @@ class ScreenCapture:
         self._stop_event = Event()
         self._frame_count = 0
 
+    def _get_sct(self):
+        """Get or create thread-local mss instance."""
+        if self.headless_mode:
+            return None
+
+        if not hasattr(self._thread_local, 'sct'):
+            self._thread_local.sct = mss.mss()
+        return self._thread_local.sct
+
     def get_monitor(self):
         """Get the monitor to capture."""
         if self.headless_mode:
             return None
 
+        sct = self._get_sct()
         if self.monitor == -1:
             # Capture all monitors
-            return self.sct.monitors[0]
-        elif 0 <= self.monitor < len(self.sct.monitors) - 1:
+            return sct.monitors[0]
+        elif 0 <= self.monitor < len(sct.monitors) - 1:
             # Capture specific monitor (monitors[0] is all, monitors[1+] are individual)
-            return self.sct.monitors[self.monitor + 1]
+            return sct.monitors[self.monitor + 1]
         else:
             # Default to primary monitor
-            return self.sct.monitors[1]
+            return sct.monitors[1]
 
     def generate_test_pattern(self):
         """
@@ -118,8 +132,9 @@ class ScreenCapture:
             img = self.generate_test_pattern()
         else:
             # Capture actual screen
+            sct = self._get_sct()
             monitor = self.get_monitor()
-            screenshot = self.sct.grab(monitor)
+            screenshot = sct.grab(monitor)
             # Convert to PIL Image
             img = Image.frombytes('RGB', screenshot.size, screenshot.rgb)
 
@@ -155,8 +170,7 @@ class ScreenCapture:
     def stop(self):
         """Stop the screen capture."""
         self._stop_event.set()
-        if self.sct:
-            self.sct.close()
+        # Thread-local mss instances will be cleaned up when threads terminate
 
 
 class Config:
