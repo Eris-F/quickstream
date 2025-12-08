@@ -9,9 +9,11 @@ A simple, barebones, and reliable LAN screen streaming service. Think of it like
 - **LAN-focused**: Optimized for local network streaming
 - **Configurable**: Easy-to-edit configuration file
 - **Custom Process Name**: Shows up as "quickstream" (or your custom name) in `top` and `ps`
-- **Cross-platform**: Works on Linux, macOS, and Windows
+- **Cross-platform**: Works on Linux, macOS, and Windows (X11 and Wayland supported)
 - **Low Latency**: MJPEG streaming for minimal delay
 - **Multiple Viewers**: Support for multiple simultaneous connections
+- **Mouse Cursor Visible**: Cursor is captured and visible in the stream
+- **Fullscreen Mode**: Built-in fullscreen button and double-click support
 
 ## Quick Start
 

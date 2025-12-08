@@ -139,12 +139,62 @@ class ScreenCapture:
             # Default to primary monitor
             return sct.monitors[1]
 
+    def _get_cursor_position(self):
+        """Get cursor position on X11 using xdotool."""
+        try:
+            result = subprocess.run(
+                ['xdotool', 'getmouselocation', '--shell'],
+                capture_output=True,
+                text=True,
+                timeout=0.1
+            )
+            if result.returncode == 0:
+                lines = result.stdout.strip().split('\n')
+                pos = {}
+                for line in lines:
+                    if '=' in line:
+                        key, value = line.split('=', 1)
+                        pos[key] = int(value)
+                return pos.get('X', 0), pos.get('Y', 0)
+        except:
+            pass
+        return None
+
+    def _draw_cursor(self, img, x, y):
+        """Draw a simple cursor on the image."""
+        draw = ImageDraw.Draw(img)
+        # Draw a simple arrow cursor
+        cursor_size = 20
+        # Arrow points
+        points = [
+            (x, y),
+            (x, y + cursor_size),
+            (x + cursor_size//3, y + cursor_size*2//3),
+            (x + cursor_size*2//3, y + cursor_size//3)
+        ]
+        # Draw cursor with black outline
+        draw.polygon(points, fill='white', outline='black')
+
     def _capture_with_mss(self):
         """Capture screen using mss library."""
         sct = self._get_sct()
         monitor = self.get_monitor()
         screenshot = sct.grab(monitor)
-        return Image.frombytes('RGB', screenshot.size, screenshot.rgb)
+        img = Image.frombytes('RGB', screenshot.size, screenshot.rgb)
+
+        # Try to add cursor overlay
+        cursor_pos = self._get_cursor_position()
+        if cursor_pos:
+            x, y = cursor_pos
+            # Adjust coordinates relative to monitor
+            monitor_left = monitor.get('left', 0)
+            monitor_top = monitor.get('top', 0)
+            rel_x = x - monitor_left
+            rel_y = y - monitor_top
+            if 0 <= rel_x < img.width and 0 <= rel_y < img.height:
+                self._draw_cursor(img, rel_x, rel_y)
+
+        return img
 
     def _capture_with_tool(self, tool_name):
         """Capture screen using external tool (grim, spectacle, gnome-screenshot)."""
@@ -152,11 +202,14 @@ class ScreenCapture:
 
         try:
             if tool_name == 'grim':
-                subprocess.run(['grim', temp_file], check=True, timeout=2, capture_output=True)
+                # -c includes cursor
+                subprocess.run(['grim', '-c', temp_file], check=True, timeout=2, capture_output=True)
             elif tool_name == 'spectacle':
-                subprocess.run(['spectacle', '-bno', temp_file], check=True, timeout=2, capture_output=True)
+                # -p includes pointer/cursor, -b is background mode, -n is no notify, -o is output
+                subprocess.run(['spectacle', '-bpno', temp_file], check=True, timeout=2, capture_output=True)
             elif tool_name == 'gnome-screenshot':
-                subprocess.run(['gnome-screenshot', '-f', temp_file], check=True, timeout=2, capture_output=True)
+                # -p includes pointer, -f is file output
+                subprocess.run(['gnome-screenshot', '-p', '-f', temp_file], check=True, timeout=2, capture_output=True)
 
             # Load the screenshot
             if os.path.exists(temp_file):
@@ -356,6 +409,7 @@ VIEWER_TEMPLATE = """
             font-size: 24px;
         }
         #stream-container {
+            position: relative;
             max-width: 95vw;
             max-height: 90vh;
             display: flex;
@@ -367,6 +421,7 @@ VIEWER_TEMPLATE = """
             max-height: 90vh;
             border: 2px solid #333;
             box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
+            cursor: pointer;
         }
         .info {
             margin: 10px;
@@ -381,9 +436,54 @@ VIEWER_TEMPLATE = """
             background-color: #28a745;
             border-radius: 4px;
             font-size: 12px;
+            z-index: 1000;
         }
         .status.disconnected {
             background-color: #dc3545;
+        }
+        .fullscreen-btn {
+            position: absolute;
+            bottom: 20px;
+            right: 20px;
+            padding: 10px 20px;
+            background-color: rgba(52, 152, 219, 0.9);
+            color: white;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: bold;
+            box-shadow: 0 2px 5px rgba(0, 0, 0, 0.3);
+            transition: background-color 0.3s, transform 0.1s;
+            z-index: 100;
+        }
+        .fullscreen-btn:hover {
+            background-color: rgba(41, 128, 185, 1);
+            transform: scale(1.05);
+        }
+        .fullscreen-btn:active {
+            transform: scale(0.95);
+        }
+        /* Fullscreen styles */
+        #stream-container:fullscreen {
+            background-color: #000;
+            max-width: 100vw;
+            max-height: 100vh;
+        }
+        #stream-container:fullscreen #stream {
+            max-width: 100vw;
+            max-height: 100vh;
+            border: none;
+        }
+        #stream-container:-webkit-full-screen {
+            background-color: #000;
+            max-width: 100vw;
+            max-height: 100vh;
+        }
+        #stream-container:-webkit-full-screen #stream {
+            max-width: 100vw;
+            max-height: 100vh;
+            border: none;
         }
     </style>
 </head>
@@ -392,12 +492,17 @@ VIEWER_TEMPLATE = """
     <h1>QuickStream</h1>
     <div id="stream-container">
         <img id="stream" src="/video_feed" alt="Stream">
+        <button class="fullscreen-btn" id="fullscreen-btn" title="Toggle fullscreen (or double-click stream)">
+            ⛶ Fullscreen
+        </button>
     </div>
-    <div class="info">Simple LAN Screen Streaming</div>
+    <div class="info">Simple LAN Screen Streaming • Double-click or use fullscreen button</div>
 
     <script>
         const img = document.getElementById('stream');
         const status = document.getElementById('status');
+        const streamContainer = document.getElementById('stream-container');
+        const fullscreenBtn = document.getElementById('fullscreen-btn');
 
         // Monitor connection status
         img.addEventListener('error', function() {
@@ -414,6 +519,46 @@ VIEWER_TEMPLATE = """
             status.textContent = 'Connected';
             status.classList.remove('disconnected');
         });
+
+        // Fullscreen functionality
+        function toggleFullscreen() {
+            if (!document.fullscreenElement && !document.webkitFullscreenElement) {
+                // Enter fullscreen
+                if (streamContainer.requestFullscreen) {
+                    streamContainer.requestFullscreen();
+                } else if (streamContainer.webkitRequestFullscreen) {
+                    streamContainer.webkitRequestFullscreen();
+                }
+            } else {
+                // Exit fullscreen
+                if (document.exitFullscreen) {
+                    document.exitFullscreen();
+                } else if (document.webkitExitFullscreen) {
+                    document.webkitExitFullscreen();
+                }
+            }
+        }
+
+        // Fullscreen button click
+        fullscreenBtn.addEventListener('click', function(e) {
+            e.stopPropagation();
+            toggleFullscreen();
+        });
+
+        // Double-click on stream to toggle fullscreen
+        img.addEventListener('dblclick', toggleFullscreen);
+
+        // Update button text when fullscreen changes
+        document.addEventListener('fullscreenchange', updateFullscreenButton);
+        document.addEventListener('webkitfullscreenchange', updateFullscreenButton);
+
+        function updateFullscreenButton() {
+            if (document.fullscreenElement || document.webkitFullscreenElement) {
+                fullscreenBtn.textContent = '⛶ Exit Fullscreen';
+            } else {
+                fullscreenBtn.textContent = '⛶ Fullscreen';
+            }
+        }
     </script>
 </body>
 </html>
