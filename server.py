@@ -12,7 +12,7 @@ import logging
 import subprocess
 import tempfile
 from pathlib import Path
-from threading import Thread, Event, local
+from threading import Thread, Event, local, Lock
 from queue import Queue, Empty
 from collections import deque
 
@@ -126,6 +126,9 @@ class ThreadedFrameBuffer:
 
 class ScreenCapture:
     """Handles screen capture functionality."""
+
+    # Class-level lock for external screenshot tools (they don't handle concurrency well)
+    _tool_lock = Lock()
 
     def __init__(self, monitor=0, quality=75, fps=30, force_method=None, use_threading=True):
         """
@@ -389,43 +392,45 @@ class ScreenCapture:
 
     def _capture_with_tool(self, tool_name):
         """Capture screen using external tool (grim, spectacle, gnome-screenshot)."""
-        temp_file = os.path.join(self._temp_dir, f'screenshot_{time.time()}.png')
+        # Use lock to serialize tool calls (they don't handle concurrent execution well)
+        with self._tool_lock:
+            temp_file = os.path.join(self._temp_dir, f'screenshot_{time.time()}.png')
 
-        try:
-            # Longer timeout since we use parallel workers
-            timeout = 2.0  # 2 seconds max per capture
+            try:
+                # Longer timeout since we use parallel workers
+                timeout = 2.0  # 2 seconds max per capture
 
-            if tool_name == 'grim':
-                # -c includes cursor
-                subprocess.run(['grim', '-c', temp_file], check=True, timeout=timeout,
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            elif tool_name == 'spectacle':
-                # -p includes pointer/cursor, -b is background mode, -n is no notify, -o is output
-                subprocess.run(['spectacle', '-bpno', temp_file], check=True, timeout=timeout,
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            elif tool_name == 'gnome-screenshot':
-                # -p includes pointer, -f is file output
-                subprocess.run(['gnome-screenshot', '-p', '-f', temp_file], check=True, timeout=timeout,
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                if tool_name == 'grim':
+                    # -c includes cursor
+                    subprocess.run(['grim', '-c', temp_file], check=True, timeout=timeout,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                elif tool_name == 'spectacle':
+                    # -p includes pointer/cursor, -b is background mode, -n is no notify, -o is output
+                    subprocess.run(['spectacle', '-bpno', temp_file], check=True, timeout=timeout,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                elif tool_name == 'gnome-screenshot':
+                    # -p includes pointer, -f is file output
+                    subprocess.run(['gnome-screenshot', '-p', '-f', temp_file], check=True, timeout=timeout,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-            # Load the screenshot
-            if os.path.exists(temp_file):
-                img = Image.open(temp_file)
-                # Convert to RGB if needed
-                if img.mode != 'RGB':
-                    img = img.convert('RGB')
-                # Clean up
-                try:
-                    os.remove(temp_file)
-                except:
-                    pass
-                return img
-            else:
-                raise Exception(f"Screenshot file not created by {tool_name}")
+                # Load the screenshot
+                if os.path.exists(temp_file):
+                    img = Image.open(temp_file)
+                    # Convert to RGB if needed
+                    if img.mode != 'RGB':
+                        img = img.convert('RGB')
+                    # Clean up
+                    try:
+                        os.remove(temp_file)
+                    except:
+                        pass
+                    return img
+                else:
+                    raise Exception(f"Screenshot file not created by {tool_name}")
 
-        except Exception as e:
-            logging.error(f"Error capturing with {tool_name}: {e}")
-            raise
+            except Exception as e:
+                logging.error(f"Error capturing with {tool_name}: {e}")
+                raise
 
     def generate_test_pattern(self):
         """
