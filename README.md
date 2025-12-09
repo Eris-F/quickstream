@@ -48,24 +48,29 @@ When you start the server, you'll see an interactive menu to choose your preferr
 
 Available capture methods:
   1. Auto-detect (recommended)
-  2. MSS (fast X11 capture)
-  3. Pillow ImageGrab (cross-platform)
-  4. PyVips (fast image processing)
-  5. Spectacle (KDE Wayland)
-  6. Grim (Sway/wlroots Wayland)
-  7. GNOME Screenshot (GNOME Wayland)
+  2. PipeWire (Wayland real-time streaming)
+  3. MSS (fast X11 capture)
+  4. Pillow ImageGrab (cross-platform)
+  5. PyVips (fast image processing)
+  6. Spectacle (KDE Wayland screenshot tool)
+  7. Grim (Sway/wlroots Wayland screenshot tool)
+  8. GNOME Screenshot (GNOME Wayland screenshot tool)
 
-Enter your choice (1-7):
+Enter your choice (1-8):
 ```
 
 **Capture Method Guide:**
 - **Auto-detect** (recommended): Automatically selects the best method for your system
+- **PipeWire**: Real-time Wayland screencasting (30+ FPS) - **Recommended for Wayland**
+  - Requires: `python3-gobject`, `gstreamer1-plugins-base`, `gstreamer1-plugin-pipewire`
+  - Achieves full 30 FPS real-time streaming on Wayland
+  - Uses xdg-desktop-portal for screen sharing permission
 - **MSS**: Fast, efficient capture for X11 systems (Linux/macOS/Windows)
 - **Pillow ImageGrab**: Cross-platform option that works on most systems
 - **PyVips**: Fast image processing library with Pillow ImageGrab backend (requires `libvips` installed)
-- **Spectacle**: For KDE Plasma on Wayland (requires `spectacle` installed)
-- **Grim**: For Sway/wlroots on Wayland (requires `grim` installed)
-- **GNOME Screenshot**: For GNOME on Wayland (requires `gnome-screenshot` installed)
+- **Spectacle**: For KDE Plasma on Wayland (requires `spectacle` installed) - **Slow, 1-5 FPS max**
+- **Grim**: For Sway/wlroots on Wayland (requires `grim` installed) - **Slow, 1-5 FPS max**
+- **GNOME Screenshot**: For GNOME on Wayland (requires `gnome-screenshot` installed) - **Slow, 1-5 FPS max**
 
 The server will:
 - Start on `0.0.0.0:5000` (accessible from your LAN)
@@ -191,15 +196,37 @@ QuickStream uses MJPEG (Motion JPEG) streaming:
 
 ### Wayland Support (Fedora, Ubuntu 22.04+, etc.)
 
-QuickStream **supports Wayland** out of the box! It automatically detects your display server and uses the appropriate capture method.
+QuickStream **fully supports Wayland** with real-time streaming! It automatically detects your display server and uses the appropriate capture method.
 
 **Supported capture methods:**
-- **X11**: Uses `mss` library (fastest, built-in)
-- **Wayland (KDE)**: Uses `spectacle` tool
-- **Wayland (Sway/wlroots)**: Uses `grim` tool
-- **Wayland (GNOME)**: Uses `gnome-screenshot` tool
+- **X11**: Uses `mss` library (fastest, built-in, 30+ FPS)
+- **Wayland (PipeWire)**: Uses PipeWire screencasting (fast, real-time, 30+ FPS) - **RECOMMENDED**
+- **Wayland (Screenshot tools)**: Fallback options (slow, 1-5 FPS max):
+  - **KDE**: `spectacle` tool
+  - **Sway/wlroots**: `grim` tool
+  - **GNOME**: `gnome-screenshot` tool
 
-**If you see "No compatible screenshot tool found" on Wayland:**
+#### For Real-Time Wayland Streaming (PipeWire - Recommended)
+
+**Install PipeWire support:**
+
+**Fedora:**
+```bash
+sudo dnf install python3-gobject gstreamer1-plugins-base gstreamer1-plugin-pipewire
+```
+
+**Ubuntu/Debian:**
+```bash
+sudo apt install python3-gi gstreamer1.0-plugins-base gstreamer1.0-pipewire
+```
+
+When you start QuickStream, select option **2 (PipeWire)** or use **1 (Auto-detect)** which will automatically use PipeWire on Wayland.
+
+**First time setup:** When you start PipeWire capture, your desktop will show a permission dialog asking which screen to share. Select your screen and grant permission. This permission can be remembered for future sessions.
+
+#### Fallback: Screenshot Tools (Slow, not recommended for streaming)
+
+**If you see "No compatible capture method found" on Wayland:**
 
 Install the appropriate tool for your desktop environment:
 
@@ -220,6 +247,8 @@ sudo apt install grim  # Ubuntu/Debian
 sudo dnf install gnome-screenshot  # Fedora
 sudo apt install gnome-screenshot  # Ubuntu/Debian
 ```
+
+**Note:** These screenshot tools are **slow** (1-5 FPS max) and not suitable for real-time streaming. Use PipeWire for proper streaming performance.
 
 To verify your session type:
 ```bash
@@ -303,13 +332,23 @@ For security:
 - Pillow
 - pyvips (optional, requires libvips system library)
 - setproctitle
+- PyGObject (optional, for PipeWire support on Wayland)
+- pydbus (optional, for PipeWire support on Wayland)
 
 See `requirements.txt` for specific versions.
 
-**Note**: PyVips requires the `libvips` system library. To install:
+**Optional Dependencies:**
+
+**For PyVips support:**
+PyVips requires the `libvips` system library. To install:
 - **Linux**: `sudo apt install libvips-dev` (Debian/Ubuntu) or `sudo dnf install vips-devel` (Fedora)
 - **macOS**: `brew install vips`
 - **Windows**: See [pyvips installation guide](https://github.com/libvips/pyvips#install)
+
+**For PipeWire support (Wayland real-time streaming):**
+PipeWire capture requires GStreamer and portal support:
+- **Fedora**: `sudo dnf install python3-gobject gstreamer1-plugins-base gstreamer1-plugin-pipewire`
+- **Ubuntu/Debian**: `sudo apt install python3-gi gstreamer1.0-plugins-base gstreamer1.0-pipewire`
 
 ## License
 

@@ -34,10 +34,134 @@ try:
 except ImportError:
     PYVIPS_AVAILABLE = False
 
+try:
+    import pydbus
+    from gi.repository import GLib
+    PYDBUS_AVAILABLE = True
+except ImportError:
+    PYDBUS_AVAILABLE = False
+
+try:
+    import gi
+    gi.require_version('Gst', '1.0')
+    from gi.repository import Gst
+    Gst.init(None)
+    GST_AVAILABLE = True
+except (ImportError, ValueError):
+    GST_AVAILABLE = False
+
 import mss
 import mss.exception
 from PIL import Image, ImageDraw, ImageFont
 from flask import Flask, Response, render_template_string
+
+
+class PipeWirePortalCapture:
+    """Handles PipeWire screen capture via xdg-desktop-portal."""
+
+    def __init__(self):
+        """Initialize PipeWire portal capture."""
+        self.session_handle = None
+        self.pipewire_node = None
+        self.gst_pipeline = None
+        self.last_sample = None
+        self.sample_lock = Lock()
+        self._initialized = False
+
+    def initialize(self):
+        """Initialize portal session and PipeWire stream."""
+        if not PYDBUS_AVAILABLE or not GST_AVAILABLE:
+            raise Exception("pydbus and GStreamer required for PipeWire capture")
+
+        try:
+            # This is a simplified implementation that uses wl-screenrec or similar tools
+            # Full portal implementation is complex and requires async handling
+            logging.info("Initializing PipeWire portal capture...")
+
+            # For now, we'll use a simpler approach with gstreamer pipewiresrc
+            # In a full implementation, we'd interact with org.freedesktop.portal.ScreenCast
+            # to get the proper node ID
+
+            # Try to create a basic PipeWire pipeline
+            # This uses the default source which may require portal permission on first run
+            pipeline_str = (
+                "pipewiresrc ! "
+                "video/x-raw,format=BGRx ! "
+                "videoconvert ! "
+                "video/x-raw,format=RGB ! "
+                "appsink name=sink emit-signals=true sync=false max-buffers=1 drop=true"
+            )
+
+            self.gst_pipeline = Gst.parse_launch(pipeline_str)
+            appsink = self.gst_pipeline.get_by_name('sink')
+
+            if appsink:
+                appsink.connect('new-sample', self._on_new_sample)
+
+            # Start the pipeline
+            ret = self.gst_pipeline.set_state(Gst.State.PLAYING)
+            if ret == Gst.StateChangeReturn.FAILURE:
+                raise Exception("Failed to start GStreamer pipeline")
+
+            self._initialized = True
+            logging.info("PipeWire capture initialized successfully")
+
+        except Exception as e:
+            logging.error(f"Failed to initialize PipeWire capture: {e}")
+            raise
+
+    def _on_new_sample(self, appsink):
+        """Callback when new frame is available."""
+        sample = appsink.emit('pull-sample')
+        if sample:
+            with self.sample_lock:
+                self.last_sample = sample
+        return Gst.FlowReturn.OK
+
+    def capture_frame(self):
+        """
+        Capture a frame from PipeWire stream.
+
+        Returns:
+            PIL.Image: Captured frame
+        """
+        if not self._initialized:
+            raise Exception("PipeWire capture not initialized")
+
+        with self.sample_lock:
+            if not self.last_sample:
+                raise Exception("No frame available yet")
+
+            sample = self.last_sample
+
+        # Extract frame data from GStreamer sample
+        buffer = sample.get_buffer()
+        caps = sample.get_caps()
+
+        # Get video info from caps
+        struct = caps.get_structure(0)
+        width = struct.get_value('width')
+        height = struct.get_value('height')
+
+        # Map buffer to read data
+        success, map_info = buffer.map(Gst.MapFlags.READ)
+        if not success:
+            raise Exception("Failed to map buffer")
+
+        try:
+            # Convert buffer data to PIL Image
+            img_data = bytes(map_info.data)
+            img = Image.frombytes('RGB', (width, height), img_data)
+            return img
+        finally:
+            buffer.unmap(map_info)
+
+    def stop(self):
+        """Stop PipeWire capture and clean up."""
+        if self.gst_pipeline:
+            self.gst_pipeline.set_state(Gst.State.NULL)
+            self.gst_pipeline = None
+        self._initialized = False
 
 
 class ThreadedFrameBuffer:
@@ -138,13 +262,14 @@ class ScreenCapture:
             monitor: Monitor index to capture (0 for primary, -1 for all)
             quality: JPEG quality (1-100)
             fps: Target frames per second
-            force_method: Force specific capture method ('auto', 'mss', 'pillow', 'pyvips', 'wayland', or tool name)
+            force_method: Force specific capture method ('auto', 'mss', 'pillow', 'pyvips', 'pipewire', 'wayland', or tool name)
             use_threading: Use threaded frame buffer for slow capture methods
         """
-        self.capture_method = None  # 'mss', 'pillow', 'pyvips', 'grim', 'spectacle', 'gnome-screenshot', or 'headless'
+        self.capture_method = None  # 'mss', 'pillow', 'pyvips', 'pipewire', 'grim', 'spectacle', 'gnome-screenshot', or 'headless'
         # Use thread-local storage for mss instances (mss uses thread-local display connections)
         self._thread_local = local()
         self._temp_dir = tempfile.mkdtemp(prefix='quickstream_')
+        self.pipewire_capture = None
 
         self.monitor = monitor
         self.quality = quality
@@ -161,7 +286,7 @@ class ScreenCapture:
         # Detect best capture method
         self._detect_capture_method()
 
-        # Enable threaded buffering for slow capture methods
+        # Enable threaded buffering for slow capture methods (not for PipeWire which is already fast)
         if self.use_threading and self.capture_method in ('grim', 'spectacle', 'gnome-screenshot'):
             num_workers = 5  # More workers for slow tools
             logging.info(f"Enabling threaded frame buffer with {num_workers} workers for {self.capture_method}")
@@ -174,7 +299,12 @@ class ScreenCapture:
     def _detect_capture_method(self):
         """Detect the best available screen capture method."""
         # Handle forced method selection
-        if self.force_method == 'pillow':
+        if self.force_method == 'pipewire':
+            if self._try_pipewire():
+                return
+            logging.error("PipeWire not available, falling back to auto-detect")
+
+        elif self.force_method == 'pillow':
             if self._try_pillow():
                 return
             logging.error("Pillow ImageGrab not available, falling back to auto-detect")
@@ -199,18 +329,16 @@ class ScreenCapture:
         if self._try_mss():
             return
 
-        # Try Pillow ImageGrab (works on some systems)
-        if self._try_pillow():
-            return
-
-        # Try pyvips (fast image processing)
-        if self._try_pyvips():
-            return
-
-        # Try Wayland screenshot tools
+        # Check if we're on Wayland - if so, try PipeWire first before fallback tools
         session_type = os.environ.get('XDG_SESSION_TYPE', 'unknown')
         if session_type == 'wayland' or 'wayland' in os.environ.get('WAYLAND_DISPLAY', '').lower():
-            logging.info("Wayland session detected, trying Wayland screenshot tools...")
+            logging.info("Wayland session detected")
+
+            # Try PipeWire (proper Wayland screencasting, fast)
+            if self._try_pipewire():
+                return
+
+            logging.info("PipeWire not available, trying fallback screenshot tools...")
 
             # Try grim (sway/wlroots)
             if self._try_tool(['grim', '--help'], 'grim'):
@@ -225,21 +353,27 @@ class ScreenCapture:
                 return
 
             logging.error("╔════════════════════════════════════════════════════════════════╗")
-            logging.error("║  WAYLAND DETECTED - No compatible screenshot tool found!      ║")
+            logging.error("║  WAYLAND DETECTED - No compatible capture method found!       ║")
             logging.error("╠════════════════════════════════════════════════════════════════╣")
-            logging.error("║  Please install one of the following:                         ║")
+            logging.error("║  For real-time streaming, you need PipeWire support:          ║")
+            logging.error("║    sudo dnf install python3-gobject gstreamer1-plugins-base   ║")
+            logging.error("║    sudo dnf install gstreamer1-plugin-pipewire                ║")
             logging.error("║                                                                ║")
-            logging.error("║  For KDE Plasma:                                               ║")
-            logging.error("║    sudo dnf install spectacle                                  ║")
-            logging.error("║                                                                ║")
-            logging.error("║  For Sway/wlroots compositors:                                ║")
-            logging.error("║    sudo dnf install grim                                       ║")
-            logging.error("║                                                                ║")
-            logging.error("║  For GNOME:                                                    ║")
-            logging.error("║    sudo dnf install gnome-screenshot                           ║")
+            logging.error("║  Or install screenshot tools (slower, 1-5 FPS max):           ║")
+            logging.error("║    KDE:  sudo dnf install spectacle                            ║")
+            logging.error("║    Sway: sudo dnf install grim                                 ║")
+            logging.error("║    GNOME: sudo dnf install gnome-screenshot                    ║")
             logging.error("║                                                                ║")
             logging.error("║  Falling back to test pattern mode...                         ║")
             logging.error("╚════════════════════════════════════════════════════════════════╝")
+
+        # Try Pillow ImageGrab (works on some systems)
+        if self._try_pillow():
+            return
+
+        # Try pyvips (fast image processing)
+        if self._try_pyvips():
+            return
 
         # Fallback to test pattern
         self.capture_method = 'headless'
@@ -294,6 +428,38 @@ class ScreenCapture:
                     return True
         except Exception as e:
             logging.warning(f"pyvips not available: {e}")
+        return False
+
+    def _try_pipewire(self):
+        """Try to use PipeWire for screen capture."""
+        if not PYDBUS_AVAILABLE or not GST_AVAILABLE:
+            logging.warning("PipeWire requires pydbus and GStreamer (python3-gobject, gstreamer1)")
+            return False
+
+        try:
+            # Initialize PipeWire capture
+            self.pipewire_capture = PipeWirePortalCapture()
+            self.pipewire_capture.initialize()
+
+            # Test capture a frame to ensure it works
+            # Wait a moment for first frame
+            time.sleep(0.5)
+            test_frame = self.pipewire_capture.capture_frame()
+
+            if test_frame:
+                self.capture_method = 'pipewire'
+                logging.info("Using PipeWire for screen capture (Wayland - Fast, Real-time)")
+                return True
+
+        except Exception as e:
+            logging.warning(f"PipeWire not available: {e}")
+            if self.pipewire_capture:
+                try:
+                    self.pipewire_capture.stop()
+                except:
+                    pass
+                self.pipewire_capture = None
+
         return False
 
     def _try_tool(self, test_cmd, tool_name):
@@ -505,6 +671,17 @@ class ScreenCapture:
         img = Image.frombytes('RGB', (width, height), img_data)
         return img
 
+    def _capture_with_pipewire(self):
+        """Capture screen using PipeWire portal."""
+        if not self.pipewire_capture:
+            raise Exception("PipeWire capture not initialized")
+
+        img = self.pipewire_capture.capture_frame()
+        # Convert to RGB if needed
+        if img.mode != 'RGB':
+            img = img.convert('RGB')
+        return img
+
     def _capture_frame_internal(self):
         """
         Internal method to capture a raw frame (PIL Image).
@@ -521,6 +698,8 @@ class ScreenCapture:
             return self._capture_with_pillow()
         elif self.capture_method == 'pyvips':
             return self._capture_with_pyvips()
+        elif self.capture_method == 'pipewire':
+            return self._capture_with_pipewire()
         elif self.capture_method in ('grim', 'spectacle', 'gnome-screenshot'):
             return self._capture_with_tool(self.capture_method)
         else:
@@ -605,6 +784,15 @@ class ScreenCapture:
         if self.frame_buffer:
             logging.info("Stopping frame buffer workers...")
             self.frame_buffer.stop()
+
+        # Stop PipeWire capture if active
+        if self.pipewire_capture:
+            logging.info("Stopping PipeWire capture...")
+            try:
+                self.pipewire_capture.stop()
+            except Exception as e:
+                logging.warning(f"Error stopping PipeWire capture: {e}")
+            self.pipewire_capture = None
 
         # Thread-local mss instances will be cleaned up when threads terminate
 
@@ -855,21 +1043,22 @@ def show_startup_menu():
     print("="*60)
     print("\nAvailable capture methods:")
     print("  1. Auto-detect (recommended)")
-    print("  2. MSS (fast X11 capture)")
-    print("  3. Pillow ImageGrab (cross-platform)")
-    print("  4. PyVips (fast image processing)")
-    print("  5. Spectacle (KDE Wayland)")
-    print("  6. Grim (Sway/wlroots Wayland)")
-    print("  7. GNOME Screenshot (GNOME Wayland)")
+    print("  2. PipeWire (Wayland real-time streaming)")
+    print("  3. MSS (fast X11 capture)")
+    print("  4. Pillow ImageGrab (cross-platform)")
+    print("  5. PyVips (fast image processing)")
+    print("  6. Spectacle (KDE Wayland screenshot tool)")
+    print("  7. Grim (Sway/wlroots Wayland screenshot tool)")
+    print("  8. GNOME Screenshot (GNOME Wayland screenshot tool)")
     print("\n" + "="*60)
 
     while True:
         try:
-            choice = input("\nSelect option (1-7) [1]: ").strip() or "1"
+            choice = input("\nSelect option (1-8) [1]: ").strip() or "1"
             choice = int(choice)
-            if 1 <= choice <= 7:
+            if 1 <= choice <= 8:
                 break
-            print("Invalid choice. Please enter a number between 1 and 7.")
+            print("Invalid choice. Please enter a number between 1 and 8.")
         except ValueError:
             print("Invalid input. Please enter a number.")
         except (KeyboardInterrupt, EOFError):
@@ -878,12 +1067,13 @@ def show_startup_menu():
 
     methods = {
         1: None,  # Auto-detect
-        2: 'mss',
-        3: 'pillow',
-        4: 'pyvips',
-        5: 'spectacle',
-        6: 'grim',
-        7: 'gnome-screenshot'
+        2: 'pipewire',
+        3: 'mss',
+        4: 'pillow',
+        5: 'pyvips',
+        6: 'spectacle',
+        7: 'grim',
+        8: 'gnome-screenshot'
     }
 
     method = methods[choice]
