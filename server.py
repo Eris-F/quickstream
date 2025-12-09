@@ -48,6 +48,8 @@ class ScreenCapture:
         self.frame_delay = 1.0 / fps
         self._stop_event = Event()
         self._frame_count = 0
+        self._last_fps_log = time.time()
+        self._fps_frame_count = 0
 
         # Detect best capture method
         self._detect_capture_method()
@@ -110,6 +112,8 @@ class ScreenCapture:
             result = subprocess.run(test_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=1)
             self.capture_method = tool_name
             logging.info(f"Using {tool_name} for screen capture (Wayland)")
+            logging.warning(f"Performance note: {tool_name} is slower than native X11 capture. "
+                          f"Expect ~5-15 FPS max. For better performance, use X11 session.")
             return True
         except (subprocess.TimeoutExpired, FileNotFoundError, Exception):
             return False
@@ -201,15 +205,21 @@ class ScreenCapture:
         temp_file = os.path.join(self._temp_dir, f'screenshot_{self._frame_count}.png')
 
         try:
+            # Reduced timeout for better responsiveness
+            timeout = 0.5  # 500ms max per capture
+
             if tool_name == 'grim':
                 # -c includes cursor
-                subprocess.run(['grim', '-c', temp_file], check=True, timeout=2, capture_output=True)
+                subprocess.run(['grim', '-c', temp_file], check=True, timeout=timeout,
+                             capture_output=True, stderr=subprocess.DEVNULL)
             elif tool_name == 'spectacle':
                 # -p includes pointer/cursor, -b is background mode, -n is no notify, -o is output
-                subprocess.run(['spectacle', '-bpno', temp_file], check=True, timeout=2, capture_output=True)
+                subprocess.run(['spectacle', '-bpno', temp_file], check=True, timeout=timeout,
+                             capture_output=True, stderr=subprocess.DEVNULL)
             elif tool_name == 'gnome-screenshot':
                 # -p includes pointer, -f is file output
-                subprocess.run(['gnome-screenshot', '-p', '-f', temp_file], check=True, timeout=2, capture_output=True)
+                subprocess.run(['gnome-screenshot', '-p', '-f', temp_file], check=True, timeout=timeout,
+                             capture_output=True, stderr=subprocess.DEVNULL)
 
             # Load the screenshot
             if os.path.exists(temp_file):
@@ -278,6 +288,8 @@ class ScreenCapture:
         Returns:
             bytes: JPEG encoded frame
         """
+        frame_start = time.time()
+
         if self.capture_method == 'headless':
             # Generate test pattern in headless mode
             img = self.generate_test_pattern()
@@ -291,9 +303,31 @@ class ScreenCapture:
             # Fallback to test pattern
             img = self.generate_test_pattern()
 
-        # Encode as JPEG
+        # Encode as JPEG (optimize=False for speed)
+        encode_start = time.time()
         buffer = io.BytesIO()
-        img.save(buffer, format='JPEG', quality=self.quality, optimize=True)
+        img.save(buffer, format='JPEG', quality=self.quality, optimize=False)
+        encode_time = time.time() - encode_start
+
+        total_time = time.time() - frame_start
+
+        # Track FPS
+        self._fps_frame_count += 1
+        time_since_last_log = time.time() - self._last_fps_log
+        if time_since_last_log >= 5.0:  # Log every 5 seconds
+            actual_fps = self._fps_frame_count / time_since_last_log
+            logging.info(f"Actual FPS: {actual_fps:.1f} (target: {self.fps}), "
+                        f"avg frame time: {(time_since_last_log/self._fps_frame_count)*1000:.1f}ms")
+            self._last_fps_log = time.time()
+            self._fps_frame_count = 0
+
+        # Log performance if frame takes longer than target
+        if total_time > self.frame_delay * 1.5:  # Only warn if 50% over target
+            logging.warning(
+                f"Frame capture slow: {total_time*1000:.1f}ms (target: {self.frame_delay*1000:.1f}ms) "
+                f"- capture: {(total_time-encode_time)*1000:.1f}ms, encode: {encode_time*1000:.1f}ms"
+            )
+
         return buffer.getvalue()
 
     def generate_frames(self):
