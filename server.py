@@ -13,6 +13,8 @@ import subprocess
 import tempfile
 from pathlib import Path
 from threading import Thread, Event, local
+from queue import Queue, Empty
+from collections import deque
 
 try:
     import setproctitle
@@ -38,10 +40,94 @@ from PIL import Image, ImageDraw, ImageFont
 from flask import Flask, Response, render_template_string
 
 
+class ThreadedFrameBuffer:
+    """Manages a pool of worker threads for parallel frame capture."""
+
+    def __init__(self, capture_func, num_workers=3, buffer_size=10):
+        """
+        Initialize threaded frame buffer.
+
+        Args:
+            capture_func: Function to call for capturing frames
+            num_workers: Number of parallel capture threads
+            buffer_size: Maximum number of frames to buffer
+        """
+        self.capture_func = capture_func
+        self.num_workers = num_workers
+        self.buffer_size = buffer_size
+        self.frame_queue = Queue(maxsize=buffer_size)
+        self.workers = []
+        self.stop_event = Event()
+        self._start_workers()
+
+    def _start_workers(self):
+        """Start worker threads."""
+        for i in range(self.num_workers):
+            worker = Thread(target=self._worker, args=(i,), daemon=True)
+            worker.start()
+            self.workers.append(worker)
+
+    def _worker(self, worker_id):
+        """Worker thread that continuously captures frames."""
+        logging.info(f"Frame capture worker {worker_id} started")
+        while not self.stop_event.is_set():
+            try:
+                # Capture a frame
+                frame_data = self.capture_func()
+                timestamp = time.time()
+
+                # Try to add to queue (non-blocking)
+                try:
+                    self.frame_queue.put((timestamp, frame_data), block=False)
+                except:
+                    # Queue full, drop oldest and try again
+                    try:
+                        self.frame_queue.get_nowait()
+                        self.frame_queue.put((timestamp, frame_data), block=False)
+                    except:
+                        pass
+
+            except Exception as e:
+                if not self.stop_event.is_set():
+                    logging.error(f"Worker {worker_id} capture error: {e}")
+                time.sleep(0.1)  # Brief pause on error
+
+    def get_frame(self, timeout=1.0):
+        """
+        Get the most recent frame from buffer.
+
+        Args:
+            timeout: Maximum time to wait for a frame
+
+        Returns:
+            Frame data or None if timeout
+        """
+        try:
+            # Get the most recent frame, discard older ones
+            timestamp, frame_data = self.frame_queue.get(timeout=timeout)
+
+            # Drain queue to get the absolute latest frame
+            while True:
+                try:
+                    timestamp, frame_data = self.frame_queue.get_nowait()
+                except Empty:
+                    break
+
+            return frame_data
+        except Empty:
+            return None
+
+    def stop(self):
+        """Stop all worker threads."""
+        self.stop_event.set()
+        for worker in self.workers:
+            worker.join(timeout=2.0)
+
+
 class ScreenCapture:
     """Handles screen capture functionality."""
 
-    def __init__(self, monitor=0, quality=75, fps=30, force_method=None):
+    def __init__(self, monitor=0, quality=75, fps=30, force_method=None, use_threading=True):
         """
         Initialize screen capture.
 
@@ -50,6 +136,7 @@ class ScreenCapture:
             quality: JPEG quality (1-100)
             fps: Target frames per second
             force_method: Force specific capture method ('auto', 'mss', 'pillow', 'pyvips', 'wayland', or tool name)
+            use_threading: Use threaded frame buffer for slow capture methods
         """
         self.capture_method = None  # 'mss', 'pillow', 'pyvips', 'grim', 'spectacle', 'gnome-screenshot', or 'headless'
         # Use thread-local storage for mss instances (mss uses thread-local display connections)
@@ -65,9 +152,21 @@ class ScreenCapture:
         self._last_fps_log = time.time()
         self._fps_frame_count = 0
         self.force_method = force_method
+        self.use_threading = use_threading
+        self.frame_buffer = None
 
         # Detect best capture method
         self._detect_capture_method()
+
+        # Enable threaded buffering for slow capture methods
+        if self.use_threading and self.capture_method in ('grim', 'spectacle', 'gnome-screenshot'):
+            num_workers = 5  # More workers for slow tools
+            logging.info(f"Enabling threaded frame buffer with {num_workers} workers for {self.capture_method}")
+            self.frame_buffer = ThreadedFrameBuffer(
+                capture_func=self._capture_frame_internal,
+                num_workers=num_workers,
+                buffer_size=10
+            )
 
     def _detect_capture_method(self):
         """Detect the best available screen capture method."""
@@ -290,11 +389,11 @@ class ScreenCapture:
 
     def _capture_with_tool(self, tool_name):
         """Capture screen using external tool (grim, spectacle, gnome-screenshot)."""
-        temp_file = os.path.join(self._temp_dir, f'screenshot_{self._frame_count}.png')
+        temp_file = os.path.join(self._temp_dir, f'screenshot_{time.time()}.png')
 
         try:
-            # Reduced timeout for better responsiveness
-            timeout = 0.5  # 500ms max per capture
+            # Longer timeout since we use parallel workers
+            timeout = 2.0  # 2 seconds max per capture
 
             if tool_name == 'grim':
                 # -c includes cursor
@@ -401,33 +500,46 @@ class ScreenCapture:
         img = Image.frombytes('RGB', (width, height), img_data)
         return img
 
+    def _capture_frame_internal(self):
+        """
+        Internal method to capture a raw frame (PIL Image).
+        Used by both direct capture and threaded buffer workers.
+
+        Returns:
+            PIL.Image: Captured image
+        """
+        if self.capture_method == 'headless':
+            return self.generate_test_pattern()
+        elif self.capture_method == 'mss':
+            return self._capture_with_mss()
+        elif self.capture_method == 'pillow':
+            return self._capture_with_pillow()
+        elif self.capture_method == 'pyvips':
+            return self._capture_with_pyvips()
+        elif self.capture_method in ('grim', 'spectacle', 'gnome-screenshot'):
+            return self._capture_with_tool(self.capture_method)
+        else:
+            return self.generate_test_pattern()
+
     def capture_frame(self):
         """
-        Capture a single frame from the screen.
+        Capture and encode a frame.
+        Uses threaded buffer if available, otherwise captures directly.
 
         Returns:
             bytes: JPEG encoded frame
         """
         frame_start = time.time()
 
-        if self.capture_method == 'headless':
-            # Generate test pattern in headless mode
-            img = self.generate_test_pattern()
-        elif self.capture_method == 'mss':
-            # Capture with mss (X11)
-            img = self._capture_with_mss()
-        elif self.capture_method == 'pillow':
-            # Capture with Pillow ImageGrab
-            img = self._capture_with_pillow()
-        elif self.capture_method == 'pyvips':
-            # Capture with pyvips
-            img = self._capture_with_pyvips()
-        elif self.capture_method in ('grim', 'spectacle', 'gnome-screenshot'):
-            # Capture with Wayland tool
-            img = self._capture_with_tool(self.capture_method)
+        # Get frame from buffer or capture directly
+        if self.frame_buffer:
+            img = self.frame_buffer.get_frame(timeout=2.0)
+            if img is None:
+                # Fallback to direct capture if buffer timeout
+                logging.warning("Frame buffer timeout, falling back to direct capture")
+                img = self._capture_frame_internal()
         else:
-            # Fallback to test pattern
-            img = self.generate_test_pattern()
+            img = self._capture_frame_internal()
 
         # Encode as JPEG (optimize=False for speed)
         encode_start = time.time()
@@ -447,8 +559,8 @@ class ScreenCapture:
             self._last_fps_log = time.time()
             self._fps_frame_count = 0
 
-        # Log performance if frame takes longer than target
-        if total_time > self.frame_delay * 1.5:  # Only warn if 50% over target
+        # Log performance if frame takes longer than target (only for non-buffered)
+        if not self.frame_buffer and total_time > self.frame_delay * 1.5:
             logging.warning(
                 f"Frame capture slow: {total_time*1000:.1f}ms (target: {self.frame_delay*1000:.1f}ms) "
                 f"- capture: {(total_time-encode_time)*1000:.1f}ms, encode: {encode_time*1000:.1f}ms"
@@ -483,6 +595,12 @@ class ScreenCapture:
     def stop(self):
         """Stop the screen capture."""
         self._stop_event.set()
+
+        # Stop frame buffer if active
+        if self.frame_buffer:
+            logging.info("Stopping frame buffer workers...")
+            self.frame_buffer.stop()
+
         # Thread-local mss instances will be cleaned up when threads terminate
 
         # Clean up temporary directory
