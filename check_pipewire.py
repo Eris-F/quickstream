@@ -50,7 +50,7 @@ try:
     else:
         print("   ✗ PipeWire plugin NOT found")
         print("\n   FIX: Install with:")
-        print("   sudo dnf install gstreamer1-plugin-pipewire")
+        print("   sudo dnf install pipewire-gstreamer")
         sys.exit(1)
 except Exception as e:
     print(f"   ✗ Error checking PipeWire plugin: {e}")

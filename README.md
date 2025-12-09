@@ -62,7 +62,7 @@ Enter your choice (1-8):
 **Capture Method Guide:**
 - **Auto-detect** (recommended): Automatically selects the best method for your system
 - **PipeWire**: Real-time Wayland screencasting (30+ FPS) - **Recommended for Wayland**
-  - Requires: `python3-gobject`, `gstreamer1-plugins-base`, `gstreamer1-plugin-pipewire`
+  - Requires: `python3-gobject`, `gstreamer1-plugins-base`, `pipewire-gstreamer`
   - Achieves full 30 FPS real-time streaming on Wayland
   - Uses xdg-desktop-portal for screen sharing permission
 - **MSS**: Fast, efficient capture for X11 systems (Linux/macOS/Windows)
@@ -237,7 +237,7 @@ sudo usermod -a -G video $USER
 **Method 3: GStreamer** 🎥 (Good - 30+ FPS, requires Python bindings)
 ```bash
 # Fedora
-sudo dnf install python3-gobject gstreamer1-plugins-base gstreamer1-plugin-pipewire
+sudo dnf install python3-gobject gstreamer1-plugins-base pipewire-gstreamer
 
 # Ubuntu/Debian
 sudo apt install python3-gi gstreamer1.0-plugins-base gstreamer1.0-pipewire
@@ -370,7 +370,7 @@ PyVips requires the `libvips` system library. To install:
 
 **For PipeWire support (Wayland real-time streaming):**
 PipeWire capture requires GStreamer and portal support:
-- **Fedora**: `sudo dnf install python3-gobject gstreamer1-plugins-base gstreamer1-plugin-pipewire`
+- **Fedora**: `sudo dnf install python3-gobject gstreamer1-plugins-base pipewire-gstreamer`
 - **Ubuntu/Debian**: `sudo apt install python3-gi gstreamer1.0-plugins-base gstreamer1.0-pipewire`
 
 ## License

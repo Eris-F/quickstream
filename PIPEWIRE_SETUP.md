@@ -13,7 +13,7 @@ sudo dnf install \
     gstreamer1 \
     gstreamer1-plugins-base \
     gstreamer1-plugins-good \
-    gstreamer1-plugin-pipewire \
+    pipewire-gstreamer \
     xdg-desktop-portal \
     xdg-desktop-portal-kde \
     pipewire \

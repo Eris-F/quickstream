@@ -56,6 +56,33 @@ from PIL import Image, ImageDraw, ImageFont
 from flask import Flask, Response, render_template_string
 
 
+# Session detection helpers
+def is_wayland():
+    """Check if running on Wayland."""
+    return os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland" or bool(os.environ.get("WAYLAND_DISPLAY"))
+
+
+def is_wlroots_session():
+    """Check if running on wlroots-based compositor (Sway, Hyprland, etc.)."""
+    desk = " ".join([
+        os.environ.get("XDG_CURRENT_DESKTOP", ""),
+        os.environ.get("XDG_SESSION_DESKTOP", ""),
+        os.environ.get("DESKTOP_SESSION", "")
+    ]).lower()
+    wlroots_keywords = ("sway", "hyprland", "wlroots", "river", "wayfire", "labwc", "niri")
+    return any(k in desk for k in wlroots_keywords)
+
+
+def is_kde_session():
+    """Check if running on KDE/Plasma."""
+    desk = " ".join([
+        os.environ.get("XDG_CURRENT_DESKTOP", ""),
+        os.environ.get("XDG_SESSION_DESKTOP", ""),
+        os.environ.get("DESKTOP_SESSION", "")
+    ]).lower()
+    return "kde" in desk or "plasma" in desk
+
+
 class FFmpegPipeWireCapture:
     """Handles screen capture using FFmpeg/wl-screenrec for Wayland."""
 
@@ -76,23 +103,29 @@ class FFmpegPipeWireCapture:
         try:
             logging.info("Initializing FFmpeg/wl-screenrec capture...")
 
-            # Check for wl-screenrec (best option for Wayland)
-            try:
-                result = subprocess.run(['which', 'wl-screenrec'], capture_output=True, timeout=1)
-                if result.returncode == 0:
-                    return self._init_wl_screenrec()
-            except:
-                pass
+            # Only try wl-screenrec on wlroots compositors (Sway, Hyprland, etc.)
+            # KDE/Plasma and GNOME use different portal mechanisms
+            if is_wlroots_session():
+                try:
+                    result = subprocess.run(['which', 'wl-screenrec'], capture_output=True, timeout=1)
+                    if result.returncode == 0:
+                        logging.info("Detected wlroots session, trying wl-screenrec...")
+                        return self._init_wl_screenrec()
+                except:
+                    pass
+            else:
+                logging.info("Not a wlroots session, skipping wl-screenrec (designed for Sway/Hyprland)")
 
-            # Check for ffmpeg
+            # Try ffmpeg kmsgrab as experimental fallback (requires DRM access)
             try:
                 result = subprocess.run(['ffmpeg', '-version'], capture_output=True, timeout=2)
                 if result.returncode == 0:
+                    logging.info("Trying FFmpeg kmsgrab (experimental, requires video group membership)...")
                     return self._init_ffmpeg_kmsgrab()
             except:
                 pass
 
-            raise Exception("Neither wl-screenrec nor ffmpeg available")
+            raise Exception("No suitable capture backend available (tried wl-screenrec and ffmpeg kmsgrab)")
 
         except Exception as e:
             logging.error(f"Failed to initialize FFmpeg capture: {e}")
@@ -297,13 +330,12 @@ class PipeWirePortalCapture:
             raise Exception("pydbus and GStreamer required for PipeWire capture")
 
         try:
-            logging.info("Initializing PipeWire portal capture...")
-
-            # Use a simpler approach: Try pipewiresrc with path property
-            # This should work with the default PipeWire screen capture
-            # On first run, the portal will show a permission dialog
+            logging.info("Initializing PipeWire portal capture (EXPERIMENTAL)...")
+            logging.warning("This capture method uses GStreamer pipewiresrc without full portal handshake")
+            logging.warning("It may not work reliably on KDE/Plasma - requires portal cooperation")
 
             # Try multiple pipeline configurations
+            # NOTE: These are best-effort attempts without proper D-Bus portal negotiation
             pipeline_configs = [
                 # Config 1: Try with specific path for screencasting
                 "pipewiresrc path=screen ! video/x-raw ! videoconvert ! video/x-raw,format=RGB ! appsink name=sink emit-signals=true sync=false max-buffers=1 drop=true",
@@ -360,7 +392,7 @@ class PipeWirePortalCapture:
 
         except Exception as e:
             logging.error(f"Failed to initialize PipeWire capture: {e}")
-            logging.error("Make sure you have: sudo dnf install gstreamer1-plugin-pipewire")
+            logging.error("Make sure you have: sudo dnf install pipewire-gstreamer python3-gobject")
             raise
 
     def _on_new_sample(self, appsink):
@@ -583,36 +615,37 @@ class ScreenCapture:
             return
 
         # Check if we're on Wayland - if so, try PipeWire first before fallback tools
-        session_type = os.environ.get('XDG_SESSION_TYPE', 'unknown')
-        if session_type == 'wayland' or 'wayland' in os.environ.get('WAYLAND_DISPLAY', '').lower():
+        if is_wayland():
             logging.info("Wayland session detected")
 
-            # Try PipeWire (proper Wayland screencasting, fast)
+            # Try PipeWire capture first (experimental but potentially fast)
             if self._try_pipewire():
                 return
 
             logging.info("PipeWire not available, trying fallback screenshot tools...")
 
-            # Try grim (sway/wlroots)
+            # Try screenshot tools in priority order
+            # grim (works on wlroots compositors)
             if self._try_tool(['grim', '--help'], 'grim'):
                 return
 
-            # Try spectacle (KDE)
+            # spectacle (KDE/Plasma)
             if self._try_tool(['spectacle', '--help'], 'spectacle'):
                 return
 
-            # Try gnome-screenshot (GNOME)
+            # gnome-screenshot (GNOME)
             if self._try_tool(['gnome-screenshot', '--help'], 'gnome-screenshot'):
                 return
 
             logging.error("╔════════════════════════════════════════════════════════════════╗")
             logging.error("║  WAYLAND DETECTED - No compatible capture method found!       ║")
             logging.error("╠════════════════════════════════════════════════════════════════╣")
-            logging.error("║  For real-time streaming, you need PipeWire support:          ║")
-            logging.error("║    sudo dnf install python3-gobject gstreamer1-plugins-base   ║")
-            logging.error("║    sudo dnf install gstreamer1-plugin-pipewire                ║")
+            logging.error("║  For real-time streaming on Wayland, install:                 ║")
+            logging.error("║    sudo dnf install pipewire-gstreamer python3-gobject        ║")
+            logging.error("║    sudo dnf install pipewire wireplumber                      ║")
+            logging.error("║    sudo dnf install xdg-desktop-portal xdg-desktop-portal-kde ║")
             logging.error("║                                                                ║")
-            logging.error("║  Or install screenshot tools (slower, 1-5 FPS max):           ║")
+            logging.error("║  Or use screenshot tools (WARNING: only 1-5 FPS max):         ║")
             logging.error("║    KDE:  sudo dnf install spectacle                            ║")
             logging.error("║    Sway: sudo dnf install grim                                 ║")
             logging.error("║    GNOME: sudo dnf install gnome-screenshot                    ║")
@@ -734,17 +767,19 @@ class ScreenCapture:
         logging.warning("PipeWire capture not available. Try:")
         logging.warning("  1. Install wl-screenrec: flatpak install flathub com.github.russelltg.wl-screenrec")
         logging.warning("  2. Install ffmpeg: sudo dnf install ffmpeg")
-        logging.warning("  3. Or install GStreamer: sudo dnf install python3-gobject gstreamer1-plugin-pipewire")
+        logging.warning("  3. Or install GStreamer: sudo dnf install pipewire-gstreamer python3-gobject")
         return False
 
     def _try_tool(self, test_cmd, tool_name):
         """Try if a screenshot tool is available."""
         try:
             result = subprocess.run(test_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=1)
+            if result.returncode != 0:
+                return False
             self.capture_method = tool_name
             logging.info(f"Using {tool_name} for screen capture (Wayland)")
-            logging.warning(f"Performance note: {tool_name} is slower than native X11 capture. "
-                          f"Expect ~5-15 FPS max. For better performance, use X11 session.")
+            logging.warning(f"Performance note: {tool_name} is a screenshot tool, NOT designed for streaming!")
+            logging.warning(f"Expect only 1-5 FPS max. For better performance, use X11 session or install PipeWire capture.")
             return True
         except (subprocess.TimeoutExpired, FileNotFoundError, Exception):
             return False
@@ -926,7 +961,10 @@ class ScreenCapture:
     def _capture_with_pyvips(self):
         """Capture screen using pyvips with Pillow ImageGrab."""
         from PIL import ImageGrab
-        import numpy as np
+        try:
+            import numpy as np
+        except ImportError:
+            raise Exception("numpy is required for pyvips capture path. Install with: pip install numpy")
 
         # Capture using Pillow
         pil_img = ImageGrab.grab()
