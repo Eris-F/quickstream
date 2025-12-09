@@ -26,6 +26,12 @@ try:
 except ImportError:
     XLIB_AVAILABLE = False
 
+try:
+    import pyvips
+    PYVIPS_AVAILABLE = True
+except ImportError:
+    PYVIPS_AVAILABLE = False
+
 import mss
 import mss.exception
 from PIL import Image, ImageDraw, ImageFont
@@ -43,9 +49,9 @@ class ScreenCapture:
             monitor: Monitor index to capture (0 for primary, -1 for all)
             quality: JPEG quality (1-100)
             fps: Target frames per second
-            force_method: Force specific capture method ('auto', 'mss', 'pillow', 'wayland', or tool name)
+            force_method: Force specific capture method ('auto', 'mss', 'pillow', 'pyvips', 'wayland', or tool name)
         """
-        self.capture_method = None  # 'mss', 'pillow', 'grim', 'spectacle', 'gnome-screenshot', or 'headless'
+        self.capture_method = None  # 'mss', 'pillow', 'pyvips', 'grim', 'spectacle', 'gnome-screenshot', or 'headless'
         # Use thread-local storage for mss instances (mss uses thread-local display connections)
         self._thread_local = local()
         self._temp_dir = tempfile.mkdtemp(prefix='quickstream_')
@@ -71,6 +77,11 @@ class ScreenCapture:
                 return
             logging.error("Pillow ImageGrab not available, falling back to auto-detect")
 
+        elif self.force_method == 'pyvips':
+            if self._try_pyvips():
+                return
+            logging.error("pyvips not available, falling back to auto-detect")
+
         elif self.force_method == 'mss':
             if self._try_mss():
                 return
@@ -88,6 +99,10 @@ class ScreenCapture:
 
         # Try Pillow ImageGrab (works on some systems)
         if self._try_pillow():
+            return
+
+        # Try pyvips (fast image processing)
+        if self._try_pyvips():
             return
 
         # Try Wayland screenshot tools
@@ -154,6 +169,29 @@ class ScreenCapture:
                 return True
         except Exception as e:
             logging.warning(f"Pillow ImageGrab not available: {e}")
+        return False
+
+    def _try_pyvips(self):
+        """Try to use pyvips for screen capture."""
+        if not PYVIPS_AVAILABLE:
+            return False
+        try:
+            # Try to create a test screenshot using pyvips
+            # pyvips doesn't have built-in screen capture, so we use it with mss or Pillow
+            # We'll use it as a processing backend with Pillow ImageGrab
+            from PIL import ImageGrab
+            test_img = ImageGrab.grab()
+            if test_img:
+                # Convert PIL image to check if pyvips works
+                import numpy as np
+                test_array = np.array(test_img)
+                test_vips = pyvips.Image.new_from_array(test_array)
+                if test_vips:
+                    self.capture_method = 'pyvips'
+                    logging.info("Using pyvips with Pillow ImageGrab for screen capture")
+                    return True
+        except Exception as e:
+            logging.warning(f"pyvips not available: {e}")
         return False
 
     def _try_tool(self, test_cmd, tool_name):
@@ -340,6 +378,29 @@ class ScreenCapture:
             img = img.convert('RGB')
         return img
 
+    def _capture_with_pyvips(self):
+        """Capture screen using pyvips with Pillow ImageGrab."""
+        from PIL import ImageGrab
+        import numpy as np
+
+        # Capture using Pillow
+        pil_img = ImageGrab.grab()
+
+        # Convert to numpy array
+        img_array = np.array(pil_img)
+
+        # Create pyvips image from numpy array
+        vips_img = pyvips.Image.new_from_array(img_array)
+
+        # Convert back to PIL for consistency with other methods
+        # This allows us to use pyvips processing if needed in the future
+        height, width = vips_img.height, vips_img.width
+        img_data = vips_img.write_to_memory()
+
+        # Convert back to PIL Image
+        img = Image.frombytes('RGB', (width, height), img_data)
+        return img
+
     def capture_frame(self):
         """
         Capture a single frame from the screen.
@@ -358,6 +419,9 @@ class ScreenCapture:
         elif self.capture_method == 'pillow':
             # Capture with Pillow ImageGrab
             img = self._capture_with_pillow()
+        elif self.capture_method == 'pyvips':
+            # Capture with pyvips
+            img = self._capture_with_pyvips()
         elif self.capture_method in ('grim', 'spectacle', 'gnome-screenshot'):
             # Capture with Wayland tool
             img = self._capture_with_tool(self.capture_method)
@@ -670,18 +734,19 @@ def show_startup_menu():
     print("  1. Auto-detect (recommended)")
     print("  2. MSS (fast X11 capture)")
     print("  3. Pillow ImageGrab (cross-platform)")
-    print("  4. Spectacle (KDE Wayland)")
-    print("  5. Grim (Sway/wlroots Wayland)")
-    print("  6. GNOME Screenshot (GNOME Wayland)")
+    print("  4. PyVips (fast image processing)")
+    print("  5. Spectacle (KDE Wayland)")
+    print("  6. Grim (Sway/wlroots Wayland)")
+    print("  7. GNOME Screenshot (GNOME Wayland)")
     print("\n" + "="*60)
 
     while True:
         try:
-            choice = input("\nSelect option (1-6) [1]: ").strip() or "1"
+            choice = input("\nSelect option (1-7) [1]: ").strip() or "1"
             choice = int(choice)
-            if 1 <= choice <= 6:
+            if 1 <= choice <= 7:
                 break
-            print("Invalid choice. Please enter a number between 1 and 6.")
+            print("Invalid choice. Please enter a number between 1 and 7.")
         except ValueError:
             print("Invalid input. Please enter a number.")
         except (KeyboardInterrupt, EOFError):
@@ -692,9 +757,10 @@ def show_startup_menu():
         1: None,  # Auto-detect
         2: 'mss',
         3: 'pillow',
-        4: 'spectacle',
-        5: 'grim',
-        6: 'gnome-screenshot'
+        4: 'pyvips',
+        5: 'spectacle',
+        6: 'grim',
+        7: 'gnome-screenshot'
     }
 
     method = methods[choice]

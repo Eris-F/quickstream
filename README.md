@@ -10,7 +10,7 @@ A simple, barebones, and reliable LAN screen streaming service. Think of it like
 - **Configurable**: Easy-to-edit configuration file
 - **Custom Process Name**: Shows up as "quickstream" (or your custom name) in `top` and `ps`
 - **Cross-platform**: Works on Linux, macOS, and Windows (X11 and Wayland supported)
-- **Multiple Capture Methods**: Choose between MSS, Pillow ImageGrab, or Wayland tools
+- **Multiple Capture Methods**: Choose between MSS, Pillow ImageGrab, PyVips, or Wayland tools
 - **Interactive Startup**: Select your preferred capture method at launch
 - **Low Latency**: MJPEG streaming for minimal delay
 - **Multiple Viewers**: Support for multiple simultaneous connections
@@ -50,17 +50,19 @@ Available capture methods:
   1. Auto-detect (recommended)
   2. MSS (fast X11 capture)
   3. Pillow ImageGrab (cross-platform)
-  4. Spectacle (KDE Wayland)
-  5. Grim (Sway/wlroots Wayland)
-  6. GNOME Screenshot (GNOME Wayland)
+  4. PyVips (fast image processing)
+  5. Spectacle (KDE Wayland)
+  6. Grim (Sway/wlroots Wayland)
+  7. GNOME Screenshot (GNOME Wayland)
 
-Enter your choice (1-6):
+Enter your choice (1-7):
 ```
 
 **Capture Method Guide:**
 - **Auto-detect** (recommended): Automatically selects the best method for your system
 - **MSS**: Fast, efficient capture for X11 systems (Linux/macOS/Windows)
 - **Pillow ImageGrab**: Cross-platform option that works on most systems
+- **PyVips**: Fast image processing library with Pillow ImageGrab backend (requires `libvips` installed)
 - **Spectacle**: For KDE Plasma on Wayland (requires `spectacle` installed)
 - **Grim**: For Sway/wlroots on Wayland (requires `grim` installed)
 - **GNOME Screenshot**: For GNOME on Wayland (requires `gnome-screenshot` installed)
@@ -299,9 +301,15 @@ For security:
 - flask
 - mss
 - Pillow
+- pyvips (optional, requires libvips system library)
 - setproctitle
 
 See `requirements.txt` for specific versions.
+
+**Note**: PyVips requires the `libvips` system library. To install:
+- **Linux**: `sudo apt install libvips-dev` (Debian/Ubuntu) or `sudo dnf install vips-devel` (Fedora)
+- **macOS**: `brew install vips`
+- **Windows**: See [pyvips installation guide](https://github.com/libvips/pyvips#install)
 
 ## License
 
