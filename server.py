@@ -56,6 +56,227 @@ from PIL import Image, ImageDraw, ImageFont
 from flask import Flask, Response, render_template_string
 
 
+class FFmpegPipeWireCapture:
+    """Handles screen capture using FFmpeg/wl-screenrec for Wayland."""
+
+    def __init__(self):
+        """Initialize FFmpeg-based capture."""
+        self.process = None
+        self.width = None
+        self.height = None
+        self.frame_size = None
+        self._initialized = False
+        self._frame_lock = Lock()
+        self._latest_frame = None
+        self._reader_thread = None
+        self._stop_event = Event()
+
+    def initialize(self):
+        """Initialize FFmpeg/wl-screenrec capture process."""
+        try:
+            logging.info("Initializing FFmpeg/wl-screenrec capture...")
+
+            # Check for wl-screenrec (best option for Wayland)
+            try:
+                result = subprocess.run(['which', 'wl-screenrec'], capture_output=True, timeout=1)
+                if result.returncode == 0:
+                    return self._init_wl_screenrec()
+            except:
+                pass
+
+            # Check for ffmpeg
+            try:
+                result = subprocess.run(['ffmpeg', '-version'], capture_output=True, timeout=2)
+                if result.returncode == 0:
+                    return self._init_ffmpeg_kmsgrab()
+            except:
+                pass
+
+            raise Exception("Neither wl-screenrec nor ffmpeg available")
+
+        except Exception as e:
+            logging.error(f"Failed to initialize FFmpeg capture: {e}")
+            raise
+
+    def _init_wl_screenrec(self):
+        """Initialize using wl-screenrec (streams Wayland screen via PipeWire)."""
+        logging.info("Using wl-screenrec for Wayland screencasting")
+
+        # Detect resolution
+        width, height = self._detect_resolution()
+        self.width = width
+        self.height = height
+        self.frame_size = width * height * 3
+
+        # Start wl-screenrec to output rawvideo to stdout
+        cmd = [
+            'wl-screenrec',
+            '--no-damage',  # Continuous capture
+            '--encode-pixfmt', 'rgb24',
+            '-f', 'rawvideo',
+            '-'  # Output to stdout
+        ]
+
+        self.process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            bufsize=self.frame_size
+        )
+
+        # Start reader thread
+        self._reader_thread = Thread(target=self._frame_reader, daemon=True)
+        self._reader_thread.start()
+
+        # Wait for first frame
+        time.sleep(0.5)
+
+        if self._latest_frame is None:
+            raise Exception("No frames received from wl-screenrec")
+
+        self._initialized = True
+        logging.info(f"wl-screenrec capture started: {width}x{height} @ RGB24")
+        return True
+
+    def _init_ffmpeg_kmsgrab(self):
+        """Initialize using FFmpeg with kmsgrab (DRM/KMS capture)."""
+        logging.info("Using FFmpeg kmsgrab for screen capture")
+
+        # Detect resolution
+        width, height = self._detect_resolution()
+        self.width = width
+        self.height = height
+        self.frame_size = width * height * 3
+
+        # FFmpeg command to capture via kmsgrab
+        cmd = [
+            'ffmpeg',
+            '-device', '/dev/dri/card0',
+            '-f', 'kmsgrab',
+            '-i', '-',
+            '-vf', f'hwdownload,format=rgb24,scale={width}:{height}',
+            '-f', 'rawvideo',
+            '-pix_fmt', 'rgb24',
+            '-r', '30',
+            '-'
+        ]
+
+        self.process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            bufsize=self.frame_size
+        )
+
+        # Start reader thread
+        self._reader_thread = Thread(target=self._frame_reader, daemon=True)
+        self._reader_thread.start()
+
+        # Wait for first frame
+        time.sleep(1.0)
+
+        if self._latest_frame is None:
+            raise Exception("No frames received from ffmpeg")
+
+        self._initialized = True
+        logging.info(f"FFmpeg kmsgrab capture started: {width}x{height} @ 30fps")
+        return True
+
+    def _detect_resolution(self):
+        """Detect screen resolution."""
+        # Try kscreen-doctor (KDE Wayland)
+        try:
+            result = subprocess.run(['kscreen-doctor', '-o'], capture_output=True, text=True, timeout=1)
+            if result.returncode == 0:
+                for line in result.stdout.split('\n'):
+                    if 'Resolution:' in line:
+                        res = line.split(':')[1].strip()
+                        w, h = res.split('x')
+                        return int(w), int(h)
+        except:
+            pass
+
+        # Try wlr-randr (wlroots)
+        try:
+            result = subprocess.run(['wlr-randr'], capture_output=True, text=True, timeout=1)
+            if result.returncode == 0:
+                for line in result.stdout.split('\n'):
+                    if 'current' in line:
+                        parts = line.split()
+                        for part in parts:
+                            if 'x' in part and part[0].isdigit():
+                                w, h = part.split('x')
+                                return int(w), int(h.split('@')[0])
+        except:
+            pass
+
+        # Default to 1920x1080
+        logging.warning("Could not detect resolution, using 1920x1080")
+        return 1920, 1080
+
+    def _frame_reader(self):
+        """Background thread to continuously read frames from process stdout."""
+        logging.info("Frame reader thread started")
+        while not self._stop_event.is_set() and self.process:
+            try:
+                # Read one frame worth of data
+                frame_data = self.process.stdout.read(self.frame_size)
+
+                if not frame_data or len(frame_data) != self.frame_size:
+                    logging.warning(f"Incomplete frame: got {len(frame_data)} bytes, expected {self.frame_size}")
+                    continue
+
+                # Convert to PIL Image
+                img = Image.frombytes('RGB', (self.width, self.height), frame_data)
+
+                # Store latest frame
+                with self._frame_lock:
+                    self._latest_frame = img
+
+            except Exception as e:
+                if not self._stop_event.is_set():
+                    logging.error(f"Frame reader error: {e}")
+                break
+
+        logging.info("Frame reader thread stopped")
+
+    def capture_frame(self):
+        """
+        Get the latest captured frame.
+
+        Returns:
+            PIL.Image: Latest captured frame
+        """
+        if not self._initialized:
+            raise Exception("FFmpeg capture not initialized")
+
+        with self._frame_lock:
+            if self._latest_frame is None:
+                raise Exception("No frame available")
+            # Return a copy to avoid threading issues
+            return self._latest_frame.copy()
+
+    def stop(self):
+        """Stop FFmpeg/wl-screenrec capture."""
+        self._stop_event.set()
+
+        if self.process:
+            try:
+                self.process.terminate()
+                self.process.wait(timeout=2)
+            except:
+                try:
+                    self.process.kill()
+                except:
+                    pass
+            self.process = None
+
+        if self._reader_thread:
+            self._reader_thread.join(timeout=2)
+
+        self._initialized = False
+
+
 class PipeWirePortalCapture:
     """Handles PipeWire screen capture via xdg-desktop-portal."""
 
@@ -464,7 +685,29 @@ class ScreenCapture:
 
     def _try_pipewire(self):
         """Try to use PipeWire for screen capture."""
-        # First try GStreamer-based approach
+        # First try FFmpeg/wl-screenrec based approach (doesn't require GStreamer)
+        try:
+            self.pipewire_capture = FFmpegPipeWireCapture()
+            self.pipewire_capture.initialize()
+
+            # Test capture a frame to ensure it works
+            test_frame = self.pipewire_capture.capture_frame()
+
+            if test_frame:
+                self.capture_method = 'pipewire'
+                logging.info("Using FFmpeg/wl-screenrec for screen capture (Wayland - Real-time)")
+                return True
+
+        except Exception as e:
+            logging.warning(f"FFmpeg/wl-screenrec not available: {e}")
+            if self.pipewire_capture:
+                try:
+                    self.pipewire_capture.stop()
+                except:
+                    pass
+                self.pipewire_capture = None
+
+        # Try GStreamer-based approach as fallback
         if PYDBUS_AVAILABLE and GST_AVAILABLE:
             try:
                 # Initialize PipeWire capture
@@ -476,7 +719,7 @@ class ScreenCapture:
 
                 if test_frame:
                     self.capture_method = 'pipewire'
-                    logging.info("Using PipeWire for screen capture (Wayland - Fast, Real-time)")
+                    logging.info("Using GStreamer PipeWire for screen capture (Wayland - Fast, Real-time)")
                     return True
 
             except Exception as e:
@@ -488,18 +731,10 @@ class ScreenCapture:
                         pass
                     self.pipewire_capture = None
 
-        # Try alternative: wf-recorder based approach (handles portal automatically)
-        try:
-            result = subprocess.run(['which', 'wf-recorder'], capture_output=True, timeout=1)
-            if result.returncode == 0:
-                logging.info("Found wf-recorder, but it's designed for video recording, not streaming")
-                # wf-recorder is for recording, not real-time streaming
-                # Skip this approach
-        except:
-            pass
-
-        logging.warning("PipeWire requires working GStreamer bindings")
-        logging.warning("Install with: sudo dnf install python3-gobject gstreamer1-plugin-pipewire")
+        logging.warning("PipeWire capture not available. Try:")
+        logging.warning("  1. Install wl-screenrec: flatpak install flathub com.github.russelltg.wl-screenrec")
+        logging.warning("  2. Install ffmpeg: sudo dnf install ffmpeg")
+        logging.warning("  3. Or install GStreamer: sudo dnf install python3-gobject gstreamer1-plugin-pipewire")
         return False
 
     def _try_tool(self, test_cmd, tool_name):

@@ -208,21 +208,44 @@ QuickStream **fully supports Wayland** with real-time streaming! It automaticall
 
 #### For Real-Time Wayland Streaming (PipeWire - Recommended)
 
-**Install PipeWire support:**
+QuickStream supports **three methods** for PipeWire screen capture, tried automatically in this order:
 
-**Fedora:**
+**Method 1: wl-screenrec** ⚡ (Best - 30+ FPS, no GStreamer required)
 ```bash
-sudo dnf install python3-gobject gstreamer1-plugins-base gstreamer1-plugin-pipewire
+# Fedora - Install via Flatpak
+flatpak install flathub com.github.russelltg.wl-screenrec
+
+# Or using dnf (if available in repos)
+sudo dnf install wl-screenrec
+
+# Source: https://github.com/russelltg/wl-screenrec
 ```
 
-**Ubuntu/Debian:**
+**Method 2: FFmpeg with kmsgrab** 🎬 (Good - 20-30 FPS, requires DRM access)
 ```bash
+# Fedora
+sudo dnf install ffmpeg
+
+# Ubuntu/Debian
+sudo apt install ffmpeg
+
+# May require adding your user to 'video' group:
+sudo usermod -a -G video $USER
+# Then log out and back in
+```
+
+**Method 3: GStreamer** 🎥 (Good - 30+ FPS, requires Python bindings)
+```bash
+# Fedora
+sudo dnf install python3-gobject gstreamer1-plugins-base gstreamer1-plugin-pipewire
+
+# Ubuntu/Debian
 sudo apt install python3-gi gstreamer1.0-plugins-base gstreamer1.0-pipewire
 ```
 
-When you start QuickStream, select option **2 (PipeWire)** or use **1 (Auto-detect)** which will automatically use PipeWire on Wayland.
+**To use:** Select option **2 (PipeWire)** or use **1 (Auto-detect)** which will automatically try these methods in order until one works.
 
-**First time setup:** When you start PipeWire capture, your desktop will show a permission dialog asking which screen to share. Select your screen and grant permission. This permission can be remembered for future sessions.
+**First time setup:** When you start PipeWire capture, your desktop may show a permission dialog asking which screen to share. Select your screen and grant permission. This permission can be remembered for future sessions.
 
 #### Fallback: Screenshot Tools (Slow, not recommended for streaming)
 
