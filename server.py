@@ -150,22 +150,43 @@ class FFmpegPipeWireCapture:
             '-'  # Output to stdout
         ]
 
-        self.process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            bufsize=self.frame_size
-        )
+        try:
+            self.process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=self.frame_size
+            )
+        except FileNotFoundError:
+            raise Exception("wl-screenrec command not found")
 
         # Start reader thread
         self._reader_thread = Thread(target=self._frame_reader, daemon=True)
         self._reader_thread.start()
 
-        # Wait for first frame
-        time.sleep(0.5)
+        # Wait for first frame with timeout
+        max_wait = 2.0
+        wait_interval = 0.1
+        waited = 0
+
+        while waited < max_wait:
+            # Check if process crashed
+            if self.process.poll() is not None:
+                stderr_output = self.process.stderr.read().decode() if self.process.stderr else ""
+                raise Exception(f"wl-screenrec exited with code {self.process.returncode}. Error: {stderr_output[:200]}")
+
+            # Check if we got a frame
+            with self._frame_lock:
+                if self._latest_frame is not None:
+                    break
+
+            time.sleep(wait_interval)
+            waited += wait_interval
 
         if self._latest_frame is None:
-            raise Exception("No frames received from wl-screenrec")
+            # Process still running but no frames - kill it
+            self.stop()
+            raise Exception("No frames received from wl-screenrec after 2 seconds")
 
         self._initialized = True
         logging.info(f"wl-screenrec capture started: {width}x{height} @ RGB24")
@@ -194,22 +215,43 @@ class FFmpegPipeWireCapture:
             '-'
         ]
 
-        self.process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            bufsize=self.frame_size
-        )
+        try:
+            self.process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=self.frame_size
+            )
+        except FileNotFoundError:
+            raise Exception("ffmpeg command not found")
 
         # Start reader thread
         self._reader_thread = Thread(target=self._frame_reader, daemon=True)
         self._reader_thread.start()
 
-        # Wait for first frame
-        time.sleep(1.0)
+        # Wait for first frame with timeout
+        max_wait = 3.0
+        wait_interval = 0.1
+        waited = 0
+
+        while waited < max_wait:
+            # Check if process crashed
+            if self.process.poll() is not None:
+                stderr_output = self.process.stderr.read().decode() if self.process.stderr else ""
+                raise Exception(f"ffmpeg exited with code {self.process.returncode}. Error: {stderr_output[:200]}")
+
+            # Check if we got a frame
+            with self._frame_lock:
+                if self._latest_frame is not None:
+                    break
+
+            time.sleep(wait_interval)
+            waited += wait_interval
 
         if self._latest_frame is None:
-            raise Exception("No frames received from ffmpeg")
+            # Process still running but no frames - kill it
+            self.stop()
+            raise Exception("No frames received from ffmpeg after 3 seconds")
 
         self._initialized = True
         logging.info(f"FFmpeg kmsgrab capture started: {width}x{height} @ 30fps")
@@ -250,14 +292,42 @@ class FFmpegPipeWireCapture:
     def _frame_reader(self):
         """Background thread to continuously read frames from process stdout."""
         logging.info("Frame reader thread started")
+        consecutive_failures = 0
+        max_consecutive_failures = 5
+
         while not self._stop_event.is_set() and self.process:
             try:
+                # Check if process is still running
+                if self.process.poll() is not None:
+                    logging.error(f"Capture process exited with code {self.process.returncode}")
+                    break
+
                 # Read one frame worth of data
                 frame_data = self.process.stdout.read(self.frame_size)
 
-                if not frame_data or len(frame_data) != self.frame_size:
-                    logging.warning(f"Incomplete frame: got {len(frame_data)} bytes, expected {self.frame_size}")
+                # Handle EOF or incomplete reads
+                if not frame_data:
+                    consecutive_failures += 1
+                    if consecutive_failures >= max_consecutive_failures:
+                        logging.error("Too many consecutive read failures (EOF), stopping frame reader")
+                        break
+                    logging.debug(f"Got EOF from capture process (attempt {consecutive_failures}/{max_consecutive_failures})")
+                    time.sleep(0.1)
                     continue
+
+                if len(frame_data) != self.frame_size:
+                    consecutive_failures += 1
+                    if consecutive_failures >= max_consecutive_failures:
+                        logging.error(f"Too many incomplete frames, stopping. Got {len(frame_data)} bytes, expected {self.frame_size}")
+                        break
+                    # Only log occasionally to avoid spam
+                    if consecutive_failures == 1 or consecutive_failures % 10 == 0:
+                        logging.warning(f"Incomplete frame: got {len(frame_data)} bytes, expected {self.frame_size}")
+                    time.sleep(0.05)
+                    continue
+
+                # Successfully read a frame
+                consecutive_failures = 0
 
                 # Convert to PIL Image
                 img = Image.frombytes('RGB', (self.width, self.height), frame_data)
