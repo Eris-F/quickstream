@@ -67,6 +67,8 @@ class PipeWirePortalCapture:
         self.last_sample = None
         self.sample_lock = Lock()
         self._initialized = False
+        self.portal = None
+        self.sender_name = None
 
     def initialize(self):
         """Initialize portal session and PipeWire stream."""
@@ -74,40 +76,70 @@ class PipeWirePortalCapture:
             raise Exception("pydbus and GStreamer required for PipeWire capture")
 
         try:
-            # This is a simplified implementation that uses wl-screenrec or similar tools
-            # Full portal implementation is complex and requires async handling
             logging.info("Initializing PipeWire portal capture...")
 
-            # For now, we'll use a simpler approach with gstreamer pipewiresrc
-            # In a full implementation, we'd interact with org.freedesktop.portal.ScreenCast
-            # to get the proper node ID
+            # Use a simpler approach: Try pipewiresrc with path property
+            # This should work with the default PipeWire screen capture
+            # On first run, the portal will show a permission dialog
 
-            # Try to create a basic PipeWire pipeline
-            # This uses the default source which may require portal permission on first run
-            pipeline_str = (
-                "pipewiresrc ! "
-                "video/x-raw,format=BGRx ! "
-                "videoconvert ! "
-                "video/x-raw,format=RGB ! "
-                "appsink name=sink emit-signals=true sync=false max-buffers=1 drop=true"
-            )
+            # Try multiple pipeline configurations
+            pipeline_configs = [
+                # Config 1: Try with specific path for screencasting
+                "pipewiresrc path=screen ! video/x-raw ! videoconvert ! video/x-raw,format=RGB ! appsink name=sink emit-signals=true sync=false max-buffers=1 drop=true",
 
-            self.gst_pipeline = Gst.parse_launch(pipeline_str)
-            appsink = self.gst_pipeline.get_by_name('sink')
+                # Config 2: Try default pipewiresrc (may pick up active screencast)
+                "pipewiresrc ! video/x-raw ! videoconvert ! video/x-raw,format=RGB ! appsink name=sink emit-signals=true sync=false max-buffers=1 drop=true",
 
-            if appsink:
-                appsink.connect('new-sample', self._on_new_sample)
+                # Config 3: Try with fd:// scheme (for portal integration)
+                "pipewiresrc fd=0 ! video/x-raw ! videoconvert ! video/x-raw,format=RGB ! appsink name=sink emit-signals=true sync=false max-buffers=1 drop=true",
+            ]
 
-            # Start the pipeline
-            ret = self.gst_pipeline.set_state(Gst.State.PLAYING)
-            if ret == Gst.StateChangeReturn.FAILURE:
-                raise Exception("Failed to start GStreamer pipeline")
+            last_error = None
+            for idx, pipeline_str in enumerate(pipeline_configs):
+                try:
+                    logging.info(f"Trying PipeWire pipeline config {idx + 1}...")
+                    self.gst_pipeline = Gst.parse_launch(pipeline_str)
+                    appsink = self.gst_pipeline.get_by_name('sink')
 
-            self._initialized = True
-            logging.info("PipeWire capture initialized successfully")
+                    if appsink:
+                        appsink.connect('new-sample', self._on_new_sample)
+
+                    # Start the pipeline
+                    ret = self.gst_pipeline.set_state(Gst.State.PLAYING)
+                    if ret == Gst.StateChangeReturn.FAILURE:
+                        raise Exception("Failed to start GStreamer pipeline")
+
+                    # Wait a bit to see if we get a frame
+                    time.sleep(1.0)
+
+                    # Check if we got a sample
+                    with self.sample_lock:
+                        if self.last_sample:
+                            self._initialized = True
+                            logging.info(f"PipeWire capture initialized successfully with config {idx + 1}")
+                            return
+
+                    # Didn't work, try next config
+                    self.gst_pipeline.set_state(Gst.State.NULL)
+                    self.gst_pipeline = None
+
+                except Exception as e:
+                    last_error = e
+                    logging.warning(f"Pipeline config {idx + 1} failed: {e}")
+                    if self.gst_pipeline:
+                        try:
+                            self.gst_pipeline.set_state(Gst.State.NULL)
+                        except:
+                            pass
+                        self.gst_pipeline = None
+                    continue
+
+            # None of the configs worked
+            raise Exception(f"All PipeWire pipeline configs failed. Last error: {last_error}")
 
         except Exception as e:
             logging.error(f"Failed to initialize PipeWire capture: {e}")
+            logging.error("Make sure you have: sudo dnf install gstreamer1-plugin-pipewire")
             raise
 
     def _on_new_sample(self, appsink):
@@ -432,34 +464,42 @@ class ScreenCapture:
 
     def _try_pipewire(self):
         """Try to use PipeWire for screen capture."""
-        if not PYDBUS_AVAILABLE or not GST_AVAILABLE:
-            logging.warning("PipeWire requires pydbus and GStreamer (python3-gobject, gstreamer1)")
-            return False
+        # First try GStreamer-based approach
+        if PYDBUS_AVAILABLE and GST_AVAILABLE:
+            try:
+                # Initialize PipeWire capture
+                self.pipewire_capture = PipeWirePortalCapture()
+                self.pipewire_capture.initialize()
 
+                # Test capture a frame to ensure it works
+                test_frame = self.pipewire_capture.capture_frame()
+
+                if test_frame:
+                    self.capture_method = 'pipewire'
+                    logging.info("Using PipeWire for screen capture (Wayland - Fast, Real-time)")
+                    return True
+
+            except Exception as e:
+                logging.warning(f"GStreamer PipeWire not available: {e}")
+                if self.pipewire_capture:
+                    try:
+                        self.pipewire_capture.stop()
+                    except:
+                        pass
+                    self.pipewire_capture = None
+
+        # Try alternative: wf-recorder based approach (handles portal automatically)
         try:
-            # Initialize PipeWire capture
-            self.pipewire_capture = PipeWirePortalCapture()
-            self.pipewire_capture.initialize()
+            result = subprocess.run(['which', 'wf-recorder'], capture_output=True, timeout=1)
+            if result.returncode == 0:
+                logging.info("Found wf-recorder, but it's designed for video recording, not streaming")
+                # wf-recorder is for recording, not real-time streaming
+                # Skip this approach
+        except:
+            pass
 
-            # Test capture a frame to ensure it works
-            # Wait a moment for first frame
-            time.sleep(0.5)
-            test_frame = self.pipewire_capture.capture_frame()
-
-            if test_frame:
-                self.capture_method = 'pipewire'
-                logging.info("Using PipeWire for screen capture (Wayland - Fast, Real-time)")
-                return True
-
-        except Exception as e:
-            logging.warning(f"PipeWire not available: {e}")
-            if self.pipewire_capture:
-                try:
-                    self.pipewire_capture.stop()
-                except:
-                    pass
-                self.pipewire_capture = None
-
+        logging.warning("PipeWire requires working GStreamer bindings")
+        logging.warning("Install with: sudo dnf install python3-gobject gstreamer1-plugin-pipewire")
         return False
 
     def _try_tool(self, test_cmd, tool_name):
