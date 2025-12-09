@@ -202,10 +202,14 @@ class FFmpegPipeWireCapture:
         self.height = height
         self.frame_size = width * height * 3
 
+        # Auto-detect DRI device (don't hardcode card0!)
+        drm_device = self._find_drm_device()
+        logging.info(f"Using DRM device: {drm_device}")
+
         # FFmpeg command to capture via kmsgrab
         cmd = [
             'ffmpeg',
-            '-device', '/dev/dri/card0',
+            '-device', drm_device,
             '-f', 'kmsgrab',
             '-i', '-',
             '-vf', f'hwdownload,format=rgb24,scale={width}:{height}',
@@ -288,6 +292,39 @@ class FFmpegPipeWireCapture:
         # Default to 1920x1080
         logging.warning("Could not detect resolution, using 1920x1080")
         return 1920, 1080
+
+    def _find_drm_device(self):
+        """Auto-detect the correct DRM device (card0, card1, etc.)."""
+        from pathlib import Path
+
+        # Check if /dev/dri exists
+        dri_path = Path('/dev/dri')
+        if not dri_path.exists():
+            logging.warning("/dev/dri not found, falling back to /dev/dri/card0")
+            return '/dev/dri/card0'
+
+        # Find all card devices
+        cards = sorted(dri_path.glob('card[0-9]*'))
+
+        if not cards:
+            logging.warning("No DRM card devices found, falling back to /dev/dri/card0")
+            return '/dev/dri/card0'
+
+        # Try to find a readable/writable card
+        for card in cards:
+            try:
+                # Check if we can read and write to this device
+                if os.access(str(card), os.R_OK | os.W_OK):
+                    logging.info(f"Found accessible DRM device: {card}")
+                    return str(card)
+            except Exception as e:
+                logging.debug(f"Cannot access {card}: {e}")
+                continue
+
+        # If no accessible card found, use the first one anyway
+        first_card = str(cards[0])
+        logging.warning(f"No accessible DRM cards found, trying {first_card} anyway")
+        return first_card
 
     def _frame_reader(self):
         """Background thread to continuously read frames from process stdout."""

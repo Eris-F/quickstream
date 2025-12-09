@@ -367,5 +367,85 @@ class TestFFmpegCaptureFrame:
         assert list(frame1.getdata()) == list(frame2.getdata())
 
 
+class TestDRMDeviceDetection:
+    """Test DRM device auto-detection."""
+
+    @patch('pathlib.Path')
+    @patch('os.access')
+    def test_find_drm_device_finds_accessible_card(self, mock_access, mock_path_cls):
+        """Test that _find_drm_device finds the first accessible card."""
+        # Mock /dev/dri exists
+        mock_dri_path = Mock()
+        mock_dri_path.exists.return_value = True
+
+        # Mock card0 (not accessible) and card1 (accessible)
+        # Add __lt__ to make them sortable
+        mock_card0 = Mock()
+        mock_card0.__str__ = Mock(return_value='/dev/dri/card0')
+        mock_card0.__lt__ = Mock(return_value=True)  # card0 < card1
+
+        mock_card1 = Mock()
+        mock_card1.__str__ = Mock(return_value='/dev/dri/card1')
+        mock_card1.__lt__ = Mock(return_value=False)  # card1 not < card0
+
+        mock_dri_path.glob.return_value = [mock_card0, mock_card1]
+        mock_path_cls.return_value = mock_dri_path
+
+        # card0 not accessible, card1 accessible
+        mock_access.side_effect = lambda path, mode: path == '/dev/dri/card1'
+
+        capture = FFmpegPipeWireCapture()
+        result = capture._find_drm_device()
+
+        assert result == '/dev/dri/card1'
+
+    @patch('pathlib.Path')
+    def test_find_drm_device_dri_not_exists(self, mock_path_cls):
+        """Test fallback when /dev/dri doesn't exist."""
+        mock_dri_path = Mock()
+        mock_dri_path.exists.return_value = False
+        mock_path_cls.return_value = mock_dri_path
+
+        capture = FFmpegPipeWireCapture()
+        result = capture._find_drm_device()
+
+        assert result == '/dev/dri/card0'
+
+    @patch('pathlib.Path')
+    def test_find_drm_device_no_cards_found(self, mock_path_cls):
+        """Test fallback when no card devices are found."""
+        mock_dri_path = Mock()
+        mock_dri_path.exists.return_value = True
+        mock_dri_path.glob.return_value = []  # No cards found
+        mock_path_cls.return_value = mock_dri_path
+
+        capture = FFmpegPipeWireCapture()
+        result = capture._find_drm_device()
+
+        assert result == '/dev/dri/card0'
+
+    @patch('pathlib.Path')
+    @patch('os.access')
+    def test_find_drm_device_no_accessible_cards(self, mock_access, mock_path_cls):
+        """Test when cards exist but none are accessible."""
+        mock_dri_path = Mock()
+        mock_dri_path.exists.return_value = True
+
+        mock_card0 = Mock()
+        mock_card0.__str__ = Mock(return_value='/dev/dri/card0')
+
+        mock_dri_path.glob.return_value = [mock_card0]
+        mock_path_cls.return_value = mock_dri_path
+
+        # No cards accessible
+        mock_access.return_value = False
+
+        capture = FFmpegPipeWireCapture()
+        result = capture._find_drm_device()
+
+        # Should fall back to first card anyway
+        assert result == '/dev/dri/card0'
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v', '--tb=short'])
