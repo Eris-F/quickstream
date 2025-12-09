@@ -19,6 +19,13 @@ try:
 except ImportError:
     setproctitle = None
 
+try:
+    from Xlib import display, X
+    from Xlib.ext import randr
+    XLIB_AVAILABLE = True
+except ImportError:
+    XLIB_AVAILABLE = False
+
 import mss
 import mss.exception
 from PIL import Image, ImageDraw, ImageFont
@@ -28,7 +35,7 @@ from flask import Flask, Response, render_template_string
 class ScreenCapture:
     """Handles screen capture functionality."""
 
-    def __init__(self, monitor=0, quality=75, fps=30):
+    def __init__(self, monitor=0, quality=75, fps=30, force_method=None):
         """
         Initialize screen capture.
 
@@ -36,8 +43,9 @@ class ScreenCapture:
             monitor: Monitor index to capture (0 for primary, -1 for all)
             quality: JPEG quality (1-100)
             fps: Target frames per second
+            force_method: Force specific capture method ('auto', 'mss', 'pillow', 'wayland', or tool name)
         """
-        self.capture_method = None  # 'mss', 'grim', 'spectacle', 'gnome-screenshot', or 'headless'
+        self.capture_method = None  # 'mss', 'pillow', 'grim', 'spectacle', 'gnome-screenshot', or 'headless'
         # Use thread-local storage for mss instances (mss uses thread-local display connections)
         self._thread_local = local()
         self._temp_dir = tempfile.mkdtemp(prefix='quickstream_')
@@ -50,23 +58,37 @@ class ScreenCapture:
         self._frame_count = 0
         self._last_fps_log = time.time()
         self._fps_frame_count = 0
+        self.force_method = force_method
 
         # Detect best capture method
         self._detect_capture_method()
 
     def _detect_capture_method(self):
         """Detect the best available screen capture method."""
+        # Handle forced method selection
+        if self.force_method == 'pillow':
+            if self._try_pillow():
+                return
+            logging.error("Pillow ImageGrab not available, falling back to auto-detect")
+
+        elif self.force_method == 'mss':
+            if self._try_mss():
+                return
+            logging.error("mss not available, falling back to auto-detect")
+
+        elif self.force_method in ('spectacle', 'grim', 'gnome-screenshot'):
+            if self._try_tool([self.force_method, '--help'], self.force_method):
+                return
+            logging.error(f"{self.force_method} not available, falling back to auto-detect")
+
+        # Auto-detect best method
         # Try mss first (works on X11, fastest)
-        try:
-            test_sct = mss.mss()
-            test_monitor = test_sct.monitors[1] if len(test_sct.monitors) > 1 else test_sct.monitors[0]
-            test_sct.grab(test_monitor)
-            test_sct.close()
-            self.capture_method = 'mss'
-            logging.info("Using mss for screen capture (X11)")
+        if self._try_mss():
             return
-        except (mss.exception.ScreenShotError, Exception) as e:
-            logging.warning(f"mss not available: {e}")
+
+        # Try Pillow ImageGrab (works on some systems)
+        if self._try_pillow():
+            return
 
         # Try Wayland screenshot tools
         session_type = os.environ.get('XDG_SESSION_TYPE', 'unknown')
@@ -105,6 +127,34 @@ class ScreenCapture:
         # Fallback to test pattern
         self.capture_method = 'headless'
         logging.warning("Running in HEADLESS mode with test pattern")
+
+    def _try_mss(self):
+        """Try to use mss for screen capture."""
+        try:
+            test_sct = mss.mss()
+            test_monitor = test_sct.monitors[1] if len(test_sct.monitors) > 1 else test_sct.monitors[0]
+            test_sct.grab(test_monitor)
+            test_sct.close()
+            self.capture_method = 'mss'
+            logging.info("Using mss for screen capture (X11)")
+            return True
+        except (mss.exception.ScreenShotError, Exception) as e:
+            logging.warning(f"mss not available: {e}")
+            return False
+
+    def _try_pillow(self):
+        """Try to use Pillow ImageGrab for screen capture."""
+        try:
+            from PIL import ImageGrab
+            # Test if it works
+            test_img = ImageGrab.grab()
+            if test_img:
+                self.capture_method = 'pillow'
+                logging.info("Using Pillow ImageGrab for screen capture")
+                return True
+        except Exception as e:
+            logging.warning(f"Pillow ImageGrab not available: {e}")
+        return False
 
     def _try_tool(self, test_cmd, tool_name):
         """Try if a screenshot tool is available."""
@@ -281,6 +331,15 @@ class ScreenCapture:
 
         return img
 
+    def _capture_with_pillow(self):
+        """Capture screen using Pillow ImageGrab."""
+        from PIL import ImageGrab
+        img = ImageGrab.grab()
+        # Convert to RGB if needed
+        if img.mode != 'RGB':
+            img = img.convert('RGB')
+        return img
+
     def capture_frame(self):
         """
         Capture a single frame from the screen.
@@ -296,6 +355,9 @@ class ScreenCapture:
         elif self.capture_method == 'mss':
             # Capture with mss (X11)
             img = self._capture_with_mss()
+        elif self.capture_method == 'pillow':
+            # Capture with Pillow ImageGrab
+            img = self._capture_with_pillow()
         elif self.capture_method in ('grim', 'spectacle', 'gnome-screenshot'):
             # Capture with Wayland tool
             img = self._capture_with_tool(self.capture_method)
@@ -599,12 +661,59 @@ VIEWER_TEMPLATE = """
 """
 
 
-def create_app(config):
+def show_startup_menu():
+    """Show interactive startup menu to select capture method."""
+    print("\n" + "="*60)
+    print("           QuickStream - Capture Method Selection")
+    print("="*60)
+    print("\nAvailable capture methods:")
+    print("  1. Auto-detect (recommended)")
+    print("  2. MSS (fast X11 capture)")
+    print("  3. Pillow ImageGrab (cross-platform)")
+    print("  4. Spectacle (KDE Wayland)")
+    print("  5. Grim (Sway/wlroots Wayland)")
+    print("  6. GNOME Screenshot (GNOME Wayland)")
+    print("\n" + "="*60)
+
+    while True:
+        try:
+            choice = input("\nSelect option (1-6) [1]: ").strip() or "1"
+            choice = int(choice)
+            if 1 <= choice <= 6:
+                break
+            print("Invalid choice. Please enter a number between 1 and 6.")
+        except ValueError:
+            print("Invalid input. Please enter a number.")
+        except (KeyboardInterrupt, EOFError):
+            print("\n\nStartup cancelled.")
+            exit(0)
+
+    methods = {
+        1: None,  # Auto-detect
+        2: 'mss',
+        3: 'pillow',
+        4: 'spectacle',
+        5: 'grim',
+        6: 'gnome-screenshot'
+    }
+
+    method = methods[choice]
+    if method:
+        print(f"\n✓ Selected: {method}")
+    else:
+        print("\n✓ Selected: Auto-detect")
+    print("="*60 + "\n")
+
+    return method
+
+
+def create_app(config, force_method=None):
     """
     Create and configure the Flask application.
 
     Args:
         config: Config object
+        force_method: Optional forced capture method
 
     Returns:
         Flask app instance
@@ -615,7 +724,8 @@ def create_app(config):
     screen_capture = ScreenCapture(
         monitor=config.get('monitor'),
         quality=config.get('quality'),
-        fps=config.get('fps')
+        fps=config.get('fps'),
+        force_method=force_method
     )
 
     @app.route('/')
@@ -644,6 +754,9 @@ def create_app(config):
 
 def main():
     """Main entry point."""
+    # Show startup menu first
+    force_method = show_startup_menu()
+
     # Setup logging
     logging.basicConfig(
         level=logging.INFO,
@@ -661,8 +774,8 @@ def main():
     else:
         logging.warning("setproctitle not available, process name not changed")
 
-    # Create Flask app
-    app = create_app(config)
+    # Create Flask app with selected capture method
+    app = create_app(config, force_method=force_method)
 
     # Get server configuration
     host = config.get('host')

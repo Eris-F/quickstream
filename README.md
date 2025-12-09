@@ -10,6 +10,8 @@ A simple, barebones, and reliable LAN screen streaming service. Think of it like
 - **Configurable**: Easy-to-edit configuration file
 - **Custom Process Name**: Shows up as "quickstream" (or your custom name) in `top` and `ps`
 - **Cross-platform**: Works on Linux, macOS, and Windows (X11 and Wayland supported)
+- **Multiple Capture Methods**: Choose between MSS, Pillow ImageGrab, or Wayland tools
+- **Interactive Startup**: Select your preferred capture method at launch
 - **Low Latency**: MJPEG streaming for minimal delay
 - **Multiple Viewers**: Support for multiple simultaneous connections
 - **Mouse Cursor Visible**: Cursor is captured and visible in the stream
@@ -36,6 +38,32 @@ Start the streaming server:
 ```bash
 python server.py
 ```
+
+When you start the server, you'll see an interactive menu to choose your preferred capture method:
+
+```
+============================================================
+           QuickStream - Capture Method Selection
+============================================================
+
+Available capture methods:
+  1. Auto-detect (recommended)
+  2. MSS (fast X11 capture)
+  3. Pillow ImageGrab (cross-platform)
+  4. Spectacle (KDE Wayland)
+  5. Grim (Sway/wlroots Wayland)
+  6. GNOME Screenshot (GNOME Wayland)
+
+Enter your choice (1-6):
+```
+
+**Capture Method Guide:**
+- **Auto-detect** (recommended): Automatically selects the best method for your system
+- **MSS**: Fast, efficient capture for X11 systems (Linux/macOS/Windows)
+- **Pillow ImageGrab**: Cross-platform option that works on most systems
+- **Spectacle**: For KDE Plasma on Wayland (requires `spectacle` installed)
+- **Grim**: For Sway/wlroots on Wayland (requires `grim` installed)
+- **GNOME Screenshot**: For GNOME on Wayland (requires `gnome-screenshot` installed)
 
 The server will:
 - Start on `0.0.0.0:5000` (accessible from your LAN)
