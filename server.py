@@ -299,15 +299,15 @@ class ScreenCapture:
             if tool_name == 'grim':
                 # -c includes cursor
                 subprocess.run(['grim', '-c', temp_file], check=True, timeout=timeout,
-                             capture_output=True, stderr=subprocess.DEVNULL)
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             elif tool_name == 'spectacle':
                 # -p includes pointer/cursor, -b is background mode, -n is no notify, -o is output
                 subprocess.run(['spectacle', '-bpno', temp_file], check=True, timeout=timeout,
-                             capture_output=True, stderr=subprocess.DEVNULL)
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             elif tool_name == 'gnome-screenshot':
                 # -p includes pointer, -f is file output
                 subprocess.run(['gnome-screenshot', '-p', '-f', temp_file], check=True, timeout=timeout,
-                             capture_output=True, stderr=subprocess.DEVNULL)
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
             # Load the screenshot
             if os.path.exists(temp_file):
