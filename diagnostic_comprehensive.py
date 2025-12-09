@@ -493,16 +493,197 @@ if pydbus:
                 traceback.print_exc()
 
 # ============================================================================
-# SECTION 6: ACTUAL PIPEWIRE CAPTURE ATTEMPT WITH FULL LOGGING
+# SECTION 6: ACTUAL CAPTURE ATTEMPTS - REAL RUNTIME TESTS
 # ============================================================================
 
-print_header("SECTION 6: ACTUAL PIPEWIRE CAPTURE ATTEMPT WITH ULTRA-VERBOSE LOGGING")
+print_header("SECTION 6: ACTUAL CAPTURE ATTEMPTS - TESTING REAL FUNCTIONALITY")
 
-print_subheader("6.1 Enable GStreamer Debug Logging")
+print_subheader("6.1 Auto-Detect DRM Device")
+drm_devices = []
+dri_path = Path('/dev/dri')
+if dri_path.exists():
+    drm_devices = sorted([str(p) for p in dri_path.glob('card[0-9]*')])
+    print_success(f"Found DRM devices: {drm_devices}")
+
+    for device in drm_devices:
+        readable = os.access(device, os.R_OK)
+        writable = os.access(device, os.W_OK)
+        print_info(f"  {device}: readable={readable}, writable={writable}")
+else:
+    print_error("/dev/dri not found!")
+
+# Choose first accessible device
+selected_drm = None
+for device in drm_devices:
+    if os.access(device, os.R_OK | os.W_OK):
+        selected_drm = device
+        print_success(f"Selected DRM device: {selected_drm}")
+        break
+
+if not selected_drm and drm_devices:
+    selected_drm = drm_devices[0]
+    print_warning(f"No accessible device, trying first one anyway: {selected_drm}")
+
+print_subheader("6.2 REAL FFmpeg kmsgrab Capture Attempt")
+if selected_drm:
+    print_info("Testing ACTUAL FFmpeg kmsgrab capture (not just checking if it exists)")
+    print_info("This is what QuickStream actually does at runtime\n")
+
+    # Test with auto-detected resolution
+    resolutions_to_test = [
+        (1920, 1080),
+        (2560, 1440),
+        (3840, 2160),
+    ]
+
+    for width, height in resolutions_to_test:
+        print_info(f"\nTrying resolution: {width}x{height}")
+
+        ffmpeg_cmd = [
+            'ffmpeg',
+            '-device', selected_drm,
+            '-f', 'kmsgrab',
+            '-i', '-',
+            '-vf', f'hwdownload,format=rgb24,scale={width}:{height}',
+            '-f', 'rawvideo',
+            '-pix_fmt', 'rgb24',
+            '-r', '30',
+            '-frames:v', '1',
+            'pipe:1'
+        ]
+
+        print_info(f"Command: {' '.join(ffmpeg_cmd)}")
+
+        try:
+            result = subprocess.run(
+                ffmpeg_cmd,
+                capture_output=True,
+                timeout=10
+            )
+
+            print_info(f"Exit code: {result.returncode}")
+            print_info(f"Stdout: {len(result.stdout)} bytes")
+            print_info(f"Stderr: {len(result.stderr)} bytes")
+
+            if result.returncode == 0:
+                expected_size = width * height * 3
+                if len(result.stdout) == expected_size:
+                    print_success(f"✓✓✓ FFmpeg kmsgrab WORKS at {width}x{height}!")
+                    break
+                else:
+                    print_warning(f"Captured {len(result.stdout)} bytes, expected {expected_size}")
+            else:
+                print_error(f"FFmpeg kmsgrab FAILED at {width}x{height}")
+                print_info("Full stderr output:")
+                for line in result.stderr.decode('utf-8', errors='replace').split('\n'):
+                    if line.strip():
+                        print(f"      {line}")
+
+        except subprocess.TimeoutExpired:
+            print_error(f"FFmpeg kmsgrab TIMEOUT at {width}x{height}")
+        except Exception as e:
+            print_error(f"FFmpeg kmsgrab ERROR: {e}")
+else:
+    print_error("No DRM device available, skipping FFmpeg kmsgrab test")
+
+print_subheader("6.3 REAL Spectacle Screenshot Attempt")
+print_info("Testing ACTUAL spectacle screenshot (not just checking if installed)")
+print_info("This is what would happen if QuickStream tried to use spectacle\n")
+
+spectacle_commands = [
+    (['spectacle', '-b', '-n', '-o', '/tmp/quickstream_spectacle_test.png'], "Full screen background capture"),
+    (['spectacle', '--nonotify', '--background', '--output', '/tmp/quickstream_spectacle_test2.png'], "Alternative syntax"),
+]
+
+for cmd, description in spectacle_commands:
+    print_info(f"\nTrying: {description}")
+    print_info(f"Command: {' '.join(cmd)}")
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+
+        print_info(f"Exit code: {result.returncode}")
+
+        if result.returncode == 0:
+            # Check if file was created
+            test_file = cmd[-1]
+            if Path(test_file).exists():
+                file_size = Path(test_file).stat().st_size
+                print_success(f"✓✓✓ Spectacle WORKS! Created {test_file} ({file_size} bytes)")
+                # Clean up
+                Path(test_file).unlink()
+                break
+            else:
+                print_error(f"Spectacle returned 0 but file not created: {test_file}")
+        else:
+            print_error(f"Spectacle FAILED")
+            print_info("Stdout:")
+            for line in result.stdout.split('\n'):
+                if line.strip():
+                    print(f"      {line}")
+            print_info("Stderr:")
+            for line in result.stderr.split('\n'):
+                if line.strip():
+                    print(f"      {line}")
+
+    except subprocess.TimeoutExpired:
+        print_error("Spectacle TIMEOUT")
+    except Exception as e:
+        print_error(f"Spectacle ERROR: {e}")
+
+print_subheader("6.4 REAL wl-screenrec Capture Attempt")
+print_info("Testing ACTUAL wl-screenrec capture (wlroots compositors only)")
+print_info("This would only work on Sway/Hyprland/etc, not KDE\n")
+
+if is_wlroots:
+    wl_cmd = [
+        'wl-screenrec',
+        '--no-damage',
+        '-f', '/tmp/quickstream_wl_test.mp4'
+    ]
+
+    print_info(f"Command: {' '.join(wl_cmd)}")
+    print_info("Running for 2 seconds...")
+
+    try:
+        proc = subprocess.Popen(
+            wl_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
+
+        time.sleep(2)
+        proc.terminate()
+        proc.wait(timeout=2)
+
+        if Path('/tmp/quickstream_wl_test.mp4').exists():
+            file_size = Path('/tmp/quickstream_wl_test.mp4').stat().st_size
+            print_success(f"✓✓✓ wl-screenrec WORKS! Created file ({file_size} bytes)")
+            Path('/tmp/quickstream_wl_test.mp4').unlink()
+        else:
+            print_error("wl-screenrec did not create output file")
+
+    except Exception as e:
+        print_error(f"wl-screenrec ERROR: {e}")
+else:
+    print_warning("Not a wlroots session, skipping wl-screenrec test")
+
+# ============================================================================
+# SECTION 7: ACTUAL PIPEWIRE CAPTURE ATTEMPT WITH FULL LOGGING
+# ============================================================================
+
+print_header("SECTION 7: ACTUAL PIPEWIRE CAPTURE ATTEMPT WITH ULTRA-VERBOSE LOGGING")
+
+print_subheader("7.1 Enable GStreamer Debug Logging")
 os.environ['GST_DEBUG'] = '4'  # Set to level 4 for detailed logging
 print_info("Set GST_DEBUG=4 for detailed GStreamer logging")
 
-print_subheader("6.2 Test PipeWire Source with State Changes")
+print_subheader("7.2 Test PipeWire Source with State Changes")
 try:
     from gi.repository import Gst
 
@@ -593,12 +774,12 @@ except Exception as e:
     traceback.print_exc()
 
 # ============================================================================
-# SECTION 7: QUICKSTREAM SERVER CAPTURE TEST
+# SECTION 8: QUICKSTREAM SERVER CAPTURE TEST
 # ============================================================================
 
-print_header("SECTION 7: QUICKSTREAM SERVER CAPTURE INITIALIZATION TEST")
+print_header("SECTION 8: QUICKSTREAM SERVER CAPTURE INITIALIZATION TEST")
 
-print_subheader("7.1 Import QuickStream server module")
+print_subheader("8.1 Import QuickStream server module")
 try:
     import server
     print_success("server module imported successfully")
@@ -609,7 +790,7 @@ except Exception as e:
     server = None
 
 if server:
-    print_subheader("7.2 Test PipeWirePortalCapture initialization")
+    print_subheader("8.2 Test PipeWirePortalCapture initialization")
     try:
         print_info("Creating PipeWirePortalCapture instance...")
         capture = server.PipeWirePortalCapture()
@@ -650,7 +831,7 @@ if server:
         import traceback
         traceback.print_exc()
 
-    print_subheader("7.3 Test FFmpegPipeWireCapture initialization")
+    print_subheader("8.3 Test FFmpegPipeWireCapture initialization")
     try:
         print_info("Creating FFmpegPipeWireCapture instance...")
         ffmpeg_capture = server.FFmpegPipeWireCapture()
@@ -686,8 +867,9 @@ print("  2. PipeWire service status and sockets")
 print("  3. DBus and portal availability")
 print("  4. GStreamer plugins and elements")
 print("  5. pydbus portal communication")
-print("  6. Actual PipeWire capture attempts")
-print("  7. QuickStream server initialization")
+print("  6. REAL capture attempts (FFmpeg kmsgrab, spectacle, wl-screenrec)")
+print("  7. Actual PipeWire GStreamer pipeline with state changes")
+print("  8. QuickStream server initialization")
 print("\nPlease send the COMPLETE output of this diagnostic back for analysis.")
 print(f"\n{BOLD}To save output to file:{RESET}")
 print(f"  python3 diagnostic_comprehensive.py > diagnostic_output.txt 2>&1")
