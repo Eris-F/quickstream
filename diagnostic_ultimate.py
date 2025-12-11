@@ -157,22 +157,27 @@ print_subheader("2.2 Optional Libraries (Linux Wayland)")
 
 optional_libs = {
     'pydbus': 'DBus communication',
-    'gi.repository.Gst': 'GStreamer (PipeWire)',
-    'gi.repository.GLib': 'GLib (PipeWire)',
+    'gi': 'PyGObject (GStreamer base)',
 }
 
 for lib, desc in optional_libs.items():
     try:
-        if '.' in lib:
-            parts = lib.split('.')
-            mod = __import__(parts[0])
-            for part in parts[1:]:
-                mod = getattr(mod, part)
-        else:
-            mod = __import__(lib)
+        mod = __import__(lib)
         print_success(f"{lib:<25} AVAILABLE - {desc}")
     except ImportError as e:
         print_warning(f"{lib:<25} NOT AVAILABLE - {desc}")
+
+# Test GStreamer specifically
+print_info("\nTesting GStreamer components:")
+try:
+    import gi
+    gi.require_version('Gst', '1.0')
+    from gi.repository import Gst
+    Gst.init(None)
+    print_success(f"  GStreamer 1.0 initialized successfully")
+    print_info(f"  Version: {Gst.version()}")
+except Exception as e:
+    print_warning(f"  GStreamer NOT available: {e}")
 
 # ============================================================================
 # SECTION 3: SCREEN CAPTURE TOOLS
