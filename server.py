@@ -679,9 +679,12 @@ class ScreenCapture:
         self._detect_capture_method()
 
         # Enable threaded buffering for slow capture methods (not for PipeWire which is already fast)
+        # NOTE: External screenshot tools use a class-level lock for serialization, so we can't
+        # benefit from multiple workers - they would just wait on the lock. Use single worker.
         if self.use_threading and self.capture_method in ('grim', 'spectacle', 'gnome-screenshot'):
-            num_workers = 5  # More workers for slow tools
-            logging.info(f"Enabling threaded frame buffer with {num_workers} workers for {self.capture_method}")
+            num_workers = 1  # Single worker since tools use serialization lock
+            logging.info(f"Enabling threaded frame buffer with {num_workers} worker for {self.capture_method}")
+            logging.info(f"Note: {self.capture_method} requires serialized access, using single worker")
             self.frame_buffer = ThreadedFrameBuffer(
                 capture_func=self._capture_frame_internal,
                 num_workers=num_workers,
@@ -988,8 +991,9 @@ class ScreenCapture:
                     subprocess.run(['grim', '-c', temp_file], check=True, timeout=timeout,
                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 elif tool_name == 'spectacle':
-                    # -p includes pointer/cursor, -b is background mode, -n is no notify, -o is output
-                    subprocess.run(['spectacle', '-bpno', temp_file], check=True, timeout=timeout,
+                    # -b is background mode, -p includes pointer/cursor, -n is no notify, -o is output
+                    # NOTE: Flags must be separate, not combined!
+                    subprocess.run(['spectacle', '-b', '-p', '-n', '-o', temp_file], check=True, timeout=timeout,
                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 elif tool_name == 'gnome-screenshot':
                     # -p includes pointer, -f is file output
