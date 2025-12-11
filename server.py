@@ -962,24 +962,40 @@ class ScreenCapture:
             return sct.monitors[1]
 
     def _get_cursor_position(self):
-        """Get cursor position on X11 using xdotool."""
-        try:
-            result = subprocess.run(
-                ['xdotool', 'getmouselocation', '--shell'],
-                capture_output=True,
-                text=True,
-                timeout=0.1
-            )
-            if result.returncode == 0:
-                lines = result.stdout.strip().split('\n')
-                pos = {}
-                for line in lines:
-                    if '=' in line:
-                        key, value = line.split('=', 1)
-                        pos[key] = int(value)
-                return pos.get('X', 0), pos.get('Y', 0)
-        except:
-            pass
+        """Get cursor position (Windows or Linux X11)."""
+        # Windows: Use ctypes to get cursor position
+        if IS_WINDOWS:
+            try:
+                import ctypes
+                class POINT(ctypes.Structure):
+                    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+                point = POINT()
+                ctypes.windll.user32.GetCursorPos(ctypes.byref(point))
+                return point.x, point.y
+            except:
+                pass
+
+        # Linux X11: Use xdotool
+        else:
+            try:
+                result = subprocess.run(
+                    ['xdotool', 'getmouselocation', '--shell'],
+                    capture_output=True,
+                    text=True,
+                    timeout=0.1
+                )
+                if result.returncode == 0:
+                    lines = result.stdout.strip().split('\n')
+                    pos = {}
+                    for line in lines:
+                        if '=' in line:
+                            key, value = line.split('=', 1)
+                            pos[key] = int(value)
+                    return pos.get('X', 0), pos.get('Y', 0)
+            except:
+                pass
+
         return None
 
     def _draw_cursor(self, img, x, y):
@@ -1109,6 +1125,15 @@ class ScreenCapture:
         # Convert to RGB if needed
         if img.mode != 'RGB':
             img = img.convert('RGB')
+
+        # Try to add cursor overlay
+        cursor_pos = self._get_cursor_position()
+        if cursor_pos:
+            x, y = cursor_pos
+            # ImageGrab captures entire screen, coordinates are absolute
+            if 0 <= x < img.width and 0 <= y < img.height:
+                self._draw_cursor(img, x, y)
+
         return img
 
     def _capture_with_pyvips(self):
@@ -1135,6 +1160,15 @@ class ScreenCapture:
 
         # Convert back to PIL Image
         img = Image.frombytes('RGB', (width, height), img_data)
+
+        # Try to add cursor overlay
+        cursor_pos = self._get_cursor_position()
+        if cursor_pos:
+            x, y = cursor_pos
+            # ImageGrab captures entire screen, coordinates are absolute
+            if 0 <= x < img.width and 0 <= y < img.height:
+                self._draw_cursor(img, x, y)
+
         return img
 
     def _capture_with_pipewire(self):
