@@ -37,33 +37,46 @@ IS_WINDOWS = platform.system() == 'Windows'
 IS_LINUX = platform.system() == 'Linux'
 IS_MACOS = platform.system() == 'Darwin'
 
-try:
-    from Xlib import display, X
-    from Xlib.ext import randr
-    XLIB_AVAILABLE = True
-except ImportError:
+# Skip Xlib on Windows (Linux X11-specific)
+if not IS_WINDOWS:
+    try:
+        from Xlib import display, X
+        from Xlib.ext import randr
+        XLIB_AVAILABLE = True
+    except ImportError:
+        XLIB_AVAILABLE = False
+else:
     XLIB_AVAILABLE = False
 
-try:
-    import pyvips
-    PYVIPS_AVAILABLE = True
-except ImportError:
+# Skip pyvips on Windows (libvips-42.dll issues)
+if not IS_WINDOWS:
+    try:
+        import pyvips
+        PYVIPS_AVAILABLE = True
+    except ImportError:
+        PYVIPS_AVAILABLE = False
+else:
     PYVIPS_AVAILABLE = False
 
-try:
-    import pydbus
-    from gi.repository import GLib
-    PYDBUS_AVAILABLE = True
-except ImportError:
-    PYDBUS_AVAILABLE = False
+# Skip pydbus and GStreamer on Windows (Linux-only Wayland/PipeWire support)
+if not IS_WINDOWS:
+    try:
+        import pydbus
+        from gi.repository import GLib
+        PYDBUS_AVAILABLE = True
+    except ImportError:
+        PYDBUS_AVAILABLE = False
 
-try:
-    import gi
-    gi.require_version('Gst', '1.0')
-    from gi.repository import Gst
-    Gst.init(None)
-    GST_AVAILABLE = True
-except (ImportError, ValueError):
+    try:
+        import gi
+        gi.require_version('Gst', '1.0')
+        from gi.repository import Gst
+        Gst.init(None)
+        GST_AVAILABLE = True
+    except (ImportError, ValueError):
+        GST_AVAILABLE = False
+else:
+    PYDBUS_AVAILABLE = False
     GST_AVAILABLE = False
 
 import mss
