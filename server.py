@@ -961,12 +961,67 @@ class ScreenCapture:
             # Default to primary monitor
             return sct.monitors[1]
 
+    def _get_screen_info(self):
+        """Get screen resolution and DPI scaling info."""
+        if IS_WINDOWS:
+            try:
+                import ctypes
+                # Make process DPI aware
+                try:
+                    ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PROCESS_PER_MONITOR_DPI_AWARE
+                except:
+                    pass
+
+                # Get screen dimensions
+                user32 = ctypes.windll.user32
+                screen_width = user32.GetSystemMetrics(0)  # SM_CXSCREEN
+                screen_height = user32.GetSystemMetrics(1)  # SM_CYSCREEN
+
+                return {
+                    'width': screen_width,
+                    'height': screen_height,
+                    'dpi_aware': True
+                }
+            except:
+                pass
+        else:
+            # Linux: Get screen info from xdpyinfo or xrandr
+            try:
+                result = subprocess.run(
+                    ['xdpyinfo'],
+                    capture_output=True,
+                    text=True,
+                    timeout=0.5
+                )
+                if result.returncode == 0:
+                    for line in result.stdout.split('\n'):
+                        if 'dimensions:' in line:
+                            # Parse: "  dimensions:    1920x1080 pixels (508x285 millimeters)"
+                            parts = line.split()
+                            if len(parts) >= 2:
+                                dims = parts[1].split('x')
+                                if len(dims) == 2:
+                                    return {
+                                        'width': int(dims[0]),
+                                        'height': int(dims[1]),
+                                        'dpi_aware': False
+                                    }
+            except:
+                pass
+        return None
+
     def _get_cursor_position(self):
         """Get cursor position (Windows or Linux X11)."""
         # Windows: Use ctypes to get cursor position
         if IS_WINDOWS:
             try:
                 import ctypes
+                # Make process DPI aware
+                try:
+                    ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PROCESS_PER_MONITOR_DPI_AWARE
+                except:
+                    pass
+
                 class POINT(ctypes.Structure):
                     _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
 
@@ -1126,11 +1181,29 @@ class ScreenCapture:
         if img.mode != 'RGB':
             img = img.convert('RGB')
 
-        # Try to add cursor overlay
+        # Try to add cursor overlay with proper scaling
         cursor_pos = self._get_cursor_position()
-        if cursor_pos:
+        screen_info = self._get_screen_info()
+
+        if cursor_pos and screen_info:
+            cursor_x, cursor_y = cursor_pos
+            screen_width = screen_info['width']
+            screen_height = screen_info['height']
+
+            # Calculate relative position (0.0 to 1.0)
+            rel_x = cursor_x / screen_width
+            rel_y = cursor_y / screen_height
+
+            # Map to captured image size
+            img_x = int(rel_x * img.width)
+            img_y = int(rel_y * img.height)
+
+            # Draw cursor if within bounds
+            if 0 <= img_x < img.width and 0 <= img_y < img.height:
+                self._draw_cursor(img, img_x, img_y)
+        elif cursor_pos:
+            # Fallback: assume cursor coords match image coords
             x, y = cursor_pos
-            # ImageGrab captures entire screen, coordinates are absolute
             if 0 <= x < img.width and 0 <= y < img.height:
                 self._draw_cursor(img, x, y)
 
@@ -1161,11 +1234,29 @@ class ScreenCapture:
         # Convert back to PIL Image
         img = Image.frombytes('RGB', (width, height), img_data)
 
-        # Try to add cursor overlay
+        # Try to add cursor overlay with proper scaling
         cursor_pos = self._get_cursor_position()
-        if cursor_pos:
+        screen_info = self._get_screen_info()
+
+        if cursor_pos and screen_info:
+            cursor_x, cursor_y = cursor_pos
+            screen_width = screen_info['width']
+            screen_height = screen_info['height']
+
+            # Calculate relative position (0.0 to 1.0)
+            rel_x = cursor_x / screen_width
+            rel_y = cursor_y / screen_height
+
+            # Map to captured image size
+            img_x = int(rel_x * img.width)
+            img_y = int(rel_y * img.height)
+
+            # Draw cursor if within bounds
+            if 0 <= img_x < img.width and 0 <= img_y < img.height:
+                self._draw_cursor(img, img_x, img_y)
+        elif cursor_pos:
+            # Fallback: assume cursor coords match image coords
             x, y = cursor_pos
-            # ImageGrab captures entire screen, coordinates are absolute
             if 0 <= x < img.width and 0 <= y < img.height:
                 self._draw_cursor(img, x, y)
 
