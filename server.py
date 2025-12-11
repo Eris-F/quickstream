@@ -6,7 +6,9 @@ A barebones, reliable screen sharing application for local networks.
 
 import io
 import os
+import sys
 import time
+import platform
 import configparser
 import logging
 import subprocess
@@ -20,6 +22,20 @@ try:
     import setproctitle
 except ImportError:
     setproctitle = None
+
+# Fast JPEG encoding library (3-6x faster than PIL)
+try:
+    import simplejpeg
+    import numpy as np
+    SIMPLEJPEG_AVAILABLE = True
+except ImportError:
+    SIMPLEJPEG_AVAILABLE = False
+    logging.info("simplejpeg not available, using PIL (slower)")
+
+# Platform detection
+IS_WINDOWS = platform.system() == 'Windows'
+IS_LINUX = platform.system() == 'Linux'
+IS_MACOS = platform.system() == 'Darwin'
 
 try:
     from Xlib import display, X
@@ -646,16 +662,20 @@ class ScreenCapture:
     # Class-level lock for external screenshot tools (they don't handle concurrency well)
     _tool_lock = Lock()
 
-    def __init__(self, monitor=0, quality=75, fps=30, force_method=None, use_threading=True):
+    def __init__(self, monitor=0, quality=60, fps=30, force_method=None, use_threading=True,
+                 max_width=None, max_height=None, fast_encoding=True):
         """
         Initialize screen capture.
 
         Args:
             monitor: Monitor index to capture (0 for primary, -1 for all)
-            quality: JPEG quality (1-100)
+            quality: JPEG quality (1-100, default 60 for better performance)
             fps: Target frames per second
             force_method: Force specific capture method ('auto', 'mss', 'pillow', 'pyvips', 'pipewire', 'wayland', or tool name)
             use_threading: Use threaded frame buffer for slow capture methods
+            max_width: Maximum frame width (scales down if larger, None for no limit)
+            max_height: Maximum frame height (scales down if larger, None for no limit)
+            fast_encoding: Use fast JPEG encoding (simplejpeg) if available
         """
         self.capture_method = None  # 'mss', 'pillow', 'pyvips', 'pipewire', 'grim', 'spectacle', 'gnome-screenshot', or 'headless'
         # Use thread-local storage for mss instances (mss uses thread-local display connections)
@@ -674,6 +694,15 @@ class ScreenCapture:
         self.force_method = force_method
         self.use_threading = use_threading
         self.frame_buffer = None
+        self.max_width = max_width
+        self.max_height = max_height
+        self.fast_encoding = fast_encoding and SIMPLEJPEG_AVAILABLE
+
+        # Log encoding method
+        if self.fast_encoding:
+            logging.info("Using simplejpeg for fast JPEG encoding (3-6x faster than PIL)")
+        else:
+            logging.info("Using PIL for JPEG encoding (install simplejpeg for 3-6x speedup)")
 
         # Detect best capture method
         self._detect_capture_method()
@@ -1106,6 +1135,76 @@ class ScreenCapture:
             img = img.convert('RGB')
         return img
 
+    def _scale_image_if_needed(self, img):
+        """
+        Scale image down if it exceeds max_width or max_height.
+
+        Args:
+            img: PIL Image
+
+        Returns:
+            PIL.Image: Scaled image (or original if no scaling needed)
+        """
+        if not self.max_width and not self.max_height:
+            return img
+
+        width, height = img.size
+        needs_scaling = False
+        scale_factor = 1.0
+
+        if self.max_width and width > self.max_width:
+            scale_factor = min(scale_factor, self.max_width / width)
+            needs_scaling = True
+
+        if self.max_height and height > self.max_height:
+            scale_factor = min(scale_factor, self.max_height / height)
+            needs_scaling = True
+
+        if needs_scaling:
+            new_width = int(width * scale_factor)
+            new_height = int(height * scale_factor)
+            # Use BILINEAR for speed (LANCZOS is slower but higher quality)
+            img = img.resize((new_width, new_height), Image.BILINEAR)
+            logging.debug(f"Scaled frame: {width}x{height} → {new_width}x{new_height} ({scale_factor:.2f}x)")
+
+        return img
+
+    def _encode_jpeg_fast(self, img):
+        """
+        Encode image as JPEG using fast encoder (simplejpeg) if available.
+
+        Args:
+            img: PIL Image
+
+        Returns:
+            bytes: JPEG encoded data
+        """
+        if self.fast_encoding:
+            # Use simplejpeg (3-6x faster than PIL)
+            # Convert PIL Image to numpy array
+            img_array = np.array(img)
+
+            # simplejpeg expects RGB format
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
+                img_array = np.array(img)
+
+            # Encode with simplejpeg
+            jpeg_data = simplejpeg.encode_jpeg(
+                img_array,
+                quality=self.quality,
+                colorspace='RGB',
+                fastdct=True  # Use fast DCT (slightly lower quality but much faster)
+            )
+            return jpeg_data
+        else:
+            # Fallback to PIL (slower)
+            buffer = io.BytesIO()
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
+            img.save(buffer, format='JPEG', quality=self.quality, optimize=False)
+            return buffer.getvalue()
+
     def _capture_frame_internal(self):
         """
         Internal method to capture a raw frame (PIL Image).
@@ -1149,10 +1248,14 @@ class ScreenCapture:
         else:
             img = self._capture_frame_internal()
 
-        # Encode as JPEG (optimize=False for speed)
+        # Scale image if needed (before encoding for better performance)
+        scale_start = time.time()
+        img = self._scale_image_if_needed(img)
+        scale_time = time.time() - scale_start
+
+        # Encode as JPEG using fast encoder
         encode_start = time.time()
-        buffer = io.BytesIO()
-        img.save(buffer, format='JPEG', quality=self.quality, optimize=False)
+        jpeg_data = self._encode_jpeg_fast(img)
         encode_time = time.time() - encode_start
 
         total_time = time.time() - frame_start
@@ -1162,19 +1265,26 @@ class ScreenCapture:
         time_since_last_log = time.time() - self._last_fps_log
         if time_since_last_log >= 5.0:  # Log every 5 seconds
             actual_fps = self._fps_frame_count / time_since_last_log
-            logging.info(f"Actual FPS: {actual_fps:.1f} (target: {self.fps}), "
-                        f"avg frame time: {(time_since_last_log/self._fps_frame_count)*1000:.1f}ms")
+            avg_frame_time = (time_since_last_log/self._fps_frame_count)*1000
+            logging.info(
+                f"Performance: {actual_fps:.1f} FPS (target: {self.fps}), "
+                f"avg frame time: {avg_frame_time:.1f}ms, "
+                f"encode: {encode_time*1000:.1f}ms, "
+                f"size: {len(jpeg_data)/1024:.1f}KB"
+            )
             self._last_fps_log = time.time()
             self._fps_frame_count = 0
 
         # Log performance if frame takes longer than target (only for non-buffered)
         if not self.frame_buffer and total_time > self.frame_delay * 1.5:
+            capture_time = total_time - encode_time - scale_time
             logging.warning(
-                f"Frame capture slow: {total_time*1000:.1f}ms (target: {self.frame_delay*1000:.1f}ms) "
-                f"- capture: {(total_time-encode_time)*1000:.1f}ms, encode: {encode_time*1000:.1f}ms"
+                f"Frame slow: {total_time*1000:.1f}ms (target: {self.frame_delay*1000:.1f}ms) "
+                f"- capture: {capture_time*1000:.1f}ms, scale: {scale_time*1000:.1f}ms, "
+                f"encode: {encode_time*1000:.1f}ms"
             )
 
-        return buffer.getvalue()
+        return jpeg_data
 
     def generate_frames(self):
         """
@@ -1236,9 +1346,12 @@ class Config:
         'process_name': 'quickstream',
         'host': '0.0.0.0',
         'port': 5000,
-        'quality': 75,
+        'quality': 60,  # Lowered from 75 for better performance
         'fps': 30,
-        'monitor': 0
+        'monitor': 0,
+        'max_width': 1920,  # Scale down to 1920 if larger
+        'max_height': 1080,  # Scale down to 1080 if larger
+        'fast_encoding': True  # Use fast JPEG encoding if available
     }
 
     def __init__(self, config_path='config.ini'):
@@ -1270,6 +1383,9 @@ class Config:
                 self.config['quality'] = server_config.getint('quality', self.config['quality'])
                 self.config['fps'] = server_config.getint('fps', self.config['fps'])
                 self.config['monitor'] = server_config.getint('monitor', self.config['monitor'])
+                self.config['max_width'] = server_config.getint('max_width', self.config['max_width'])
+                self.config['max_height'] = server_config.getint('max_height', self.config['max_height'])
+                self.config['fast_encoding'] = server_config.getboolean('fast_encoding', self.config['fast_encoding'])
 
             logging.info(f"Configuration loaded from {self.config_path}")
         except Exception as e:
@@ -1528,7 +1644,10 @@ def create_app(config, force_method=None):
         monitor=config.get('monitor'),
         quality=config.get('quality'),
         fps=config.get('fps'),
-        force_method=force_method
+        force_method=force_method,
+        max_width=config.get('max_width'),
+        max_height=config.get('max_height'),
+        fast_encoding=config.get('fast_encoding')
     )
 
     @app.route('/')
