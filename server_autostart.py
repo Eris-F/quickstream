@@ -1,0 +1,1854 @@
+#!/usr/bin/env python3
+"""
+QuickStream Auto-Start Server
+Automatically starts with Pillow ImageGrab capture method,
+displays IP address for 5 seconds, then hides the console window.
+"""
+
+import io
+import os
+import sys
+import time
+import socket
+import platform
+import configparser
+import logging
+import subprocess
+import tempfile
+from pathlib import Path
+from threading import Thread, Event, local, Lock
+from queue import Queue, Empty
+from collections import deque
+
+try:
+    import setproctitle
+except ImportError:
+    setproctitle = None
+
+# Fast JPEG encoding library (3-6x faster than PIL)
+try:
+    import simplejpeg
+    import numpy as np
+    SIMPLEJPEG_AVAILABLE = True
+except ImportError:
+    SIMPLEJPEG_AVAILABLE = False
+    logging.info("simplejpeg not available, using PIL (slower)")
+
+# Platform detection
+IS_WINDOWS = platform.system() == 'Windows'
+IS_LINUX = platform.system() == 'Linux'
+IS_MACOS = platform.system() == 'Darwin'
+
+# Skip Xlib on Windows (Linux X11-specific)
+if not IS_WINDOWS:
+    try:
+        from Xlib import display, X
+        from Xlib.ext import randr
+        XLIB_AVAILABLE = True
+    except ImportError:
+        XLIB_AVAILABLE = False
+else:
+    XLIB_AVAILABLE = False
+
+# Skip pyvips on Windows (libvips-42.dll issues)
+if not IS_WINDOWS:
+    try:
+        import pyvips
+        PYVIPS_AVAILABLE = True
+    except ImportError:
+        PYVIPS_AVAILABLE = False
+else:
+    PYVIPS_AVAILABLE = False
+
+# Skip pydbus and GStreamer on Windows (Linux-only Wayland/PipeWire support)
+if not IS_WINDOWS:
+    try:
+        import pydbus
+        from gi.repository import GLib
+        PYDBUS_AVAILABLE = True
+    except ImportError:
+        PYDBUS_AVAILABLE = False
+
+    try:
+        import gi
+        gi.require_version('Gst', '1.0')
+        from gi.repository import Gst
+        Gst.init(None)
+        GST_AVAILABLE = True
+    except (ImportError, ValueError):
+        GST_AVAILABLE = False
+else:
+    PYDBUS_AVAILABLE = False
+    GST_AVAILABLE = False
+
+import mss
+import mss.exception
+from PIL import Image, ImageDraw, ImageFont
+from flask import Flask, Response, render_template_string
+
+
+def get_local_ip():
+    """Get the local IP address of this machine."""
+    try:
+        # Create a socket to determine the local IP
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(0)
+        # Connect to a public address (doesn't actually send data)
+        s.connect(('8.8.8.8', 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return '127.0.0.1'
+
+
+def hide_console_window():
+    """Hide the console window completely (not visible on taskbar)."""
+    if IS_WINDOWS:
+        try:
+            import ctypes
+            # Get the console window handle
+            kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+            user32 = ctypes.WinDLL('user32', use_last_error=True)
+
+            hwnd = kernel32.GetConsoleWindow()
+            if hwnd:
+                # SW_HIDE = 0 (completely hides the window)
+                user32.ShowWindow(hwnd, 0)
+                return True
+        except Exception as e:
+            logging.warning(f"Could not hide console window: {e}")
+    return False
+
+
+def show_startup_info(port, display_time=5):
+    """Display startup information for a short period before hiding."""
+    local_ip = get_local_ip()
+
+    print("\n" + "=" * 60)
+    print("           QuickStream - Auto-Start Server")
+    print("=" * 60)
+    print(f"\n  Server starting with Pillow ImageGrab capture...")
+    print(f"\n  Access the stream at:")
+    print(f"    Local:   http://localhost:{port}")
+    print(f"    Network: http://{local_ip}:{port}")
+    print(f"\n  Window will hide in {display_time} seconds...")
+    print("  (Server continues running in background)")
+    print("\n" + "=" * 60)
+
+    # Countdown
+    for i in range(display_time, 0, -1):
+        print(f"\r  Hiding in {i}...  ", end='', flush=True)
+        time.sleep(1)
+
+    print("\r  Window hidden!   ")
+    return local_ip
+
+
+# Session detection helpers
+def is_wayland():
+    """Check if running on Wayland."""
+    return os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland" or bool(os.environ.get("WAYLAND_DISPLAY"))
+
+
+def is_wlroots_session():
+    """Check if running on wlroots-based compositor (Sway, Hyprland, etc.)."""
+    desk = " ".join([
+        os.environ.get("XDG_CURRENT_DESKTOP", ""),
+        os.environ.get("XDG_SESSION_DESKTOP", ""),
+        os.environ.get("DESKTOP_SESSION", "")
+    ]).lower()
+    wlroots_keywords = ("sway", "hyprland", "wlroots", "river", "wayfire", "labwc", "niri")
+    return any(k in desk for k in wlroots_keywords)
+
+
+def is_kde_session():
+    """Check if running on KDE/Plasma."""
+    desk = " ".join([
+        os.environ.get("XDG_CURRENT_DESKTOP", ""),
+        os.environ.get("XDG_SESSION_DESKTOP", ""),
+        os.environ.get("DESKTOP_SESSION", "")
+    ]).lower()
+    return "kde" in desk or "plasma" in desk
+
+
+class FFmpegPipeWireCapture:
+    """Handles screen capture using FFmpeg/wl-screenrec for Wayland."""
+
+    def __init__(self):
+        """Initialize FFmpeg-based capture."""
+        self.process = None
+        self.width = None
+        self.height = None
+        self.frame_size = None
+        self._initialized = False
+        self._frame_lock = Lock()
+        self._latest_frame = None
+        self._reader_thread = None
+        self._stop_event = Event()
+
+    def initialize(self):
+        """Initialize FFmpeg/wl-screenrec capture process."""
+        try:
+            logging.info("Initializing FFmpeg/wl-screenrec capture...")
+
+            # Only try wl-screenrec on wlroots compositors (Sway, Hyprland, etc.)
+            # KDE/Plasma and GNOME use different portal mechanisms
+            if is_wlroots_session():
+                try:
+                    result = subprocess.run(['which', 'wl-screenrec'], capture_output=True, timeout=1)
+                    if result.returncode == 0:
+                        logging.info("Detected wlroots session, trying wl-screenrec...")
+                        return self._init_wl_screenrec()
+                except:
+                    pass
+            else:
+                logging.info("Not a wlroots session, skipping wl-screenrec (designed for Sway/Hyprland)")
+
+            # Try ffmpeg kmsgrab as experimental fallback (requires DRM access)
+            try:
+                result = subprocess.run(['ffmpeg', '-version'], capture_output=True, timeout=2)
+                if result.returncode == 0:
+                    logging.info("Trying FFmpeg kmsgrab (experimental, requires video group membership)...")
+                    return self._init_ffmpeg_kmsgrab()
+            except:
+                pass
+
+            raise Exception("No suitable capture backend available (tried wl-screenrec and ffmpeg kmsgrab)")
+
+        except Exception as e:
+            logging.error(f"Failed to initialize FFmpeg capture: {e}")
+            raise
+
+    def _init_wl_screenrec(self):
+        """Initialize using wl-screenrec (streams Wayland screen via PipeWire)."""
+        logging.info("Using wl-screenrec for Wayland screencasting")
+
+        # Detect resolution
+        width, height = self._detect_resolution()
+        self.width = width
+        self.height = height
+        self.frame_size = width * height * 3
+
+        # Start wl-screenrec to output rawvideo to stdout
+        cmd = [
+            'wl-screenrec',
+            '--no-damage',  # Continuous capture
+            '--encode-pixfmt', 'rgb24',
+            '-f', 'rawvideo',
+            '-'  # Output to stdout
+        ]
+
+        try:
+            self.process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=self.frame_size
+            )
+        except FileNotFoundError:
+            raise Exception("wl-screenrec command not found")
+
+        # Start reader thread
+        self._reader_thread = Thread(target=self._frame_reader, daemon=True)
+        self._reader_thread.start()
+
+        # Wait for first frame with timeout
+        max_wait = 2.0
+        wait_interval = 0.1
+        waited = 0
+
+        while waited < max_wait:
+            # Check if process crashed
+            if self.process.poll() is not None:
+                stderr_output = self.process.stderr.read().decode() if self.process.stderr else ""
+                raise Exception(f"wl-screenrec exited with code {self.process.returncode}. Error: {stderr_output[:200]}")
+
+            # Check if we got a frame
+            with self._frame_lock:
+                if self._latest_frame is not None:
+                    break
+
+            time.sleep(wait_interval)
+            waited += wait_interval
+
+        if self._latest_frame is None:
+            # Process still running but no frames - kill it
+            self.stop()
+            raise Exception("No frames received from wl-screenrec after 2 seconds")
+
+        self._initialized = True
+        logging.info(f"wl-screenrec capture started: {width}x{height} @ RGB24")
+        return True
+
+    def _init_ffmpeg_kmsgrab(self):
+        """Initialize using FFmpeg with kmsgrab (DRM/KMS capture)."""
+        logging.info("Using FFmpeg kmsgrab for screen capture")
+
+        # Detect resolution
+        width, height = self._detect_resolution()
+        self.width = width
+        self.height = height
+        self.frame_size = width * height * 3
+
+        # Auto-detect DRI device (don't hardcode card0!)
+        drm_device = self._find_drm_device()
+        logging.info(f"Using DRM device: {drm_device}")
+
+        # FFmpeg command to capture via kmsgrab
+        cmd = [
+            'ffmpeg',
+            '-device', drm_device,
+            '-f', 'kmsgrab',
+            '-i', '-',
+            '-vf', f'hwdownload,format=rgb24,scale={width}:{height}',
+            '-f', 'rawvideo',
+            '-pix_fmt', 'rgb24',
+            '-r', '30',
+            '-'
+        ]
+
+        try:
+            self.process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=self.frame_size
+            )
+        except FileNotFoundError:
+            raise Exception("ffmpeg command not found")
+
+        # Start reader thread
+        self._reader_thread = Thread(target=self._frame_reader, daemon=True)
+        self._reader_thread.start()
+
+        # Wait for first frame with timeout
+        max_wait = 3.0
+        wait_interval = 0.1
+        waited = 0
+
+        while waited < max_wait:
+            # Check if process crashed
+            if self.process.poll() is not None:
+                stderr_output = self.process.stderr.read().decode() if self.process.stderr else ""
+                raise Exception(f"ffmpeg exited with code {self.process.returncode}. Error: {stderr_output[:200]}")
+
+            # Check if we got a frame
+            with self._frame_lock:
+                if self._latest_frame is not None:
+                    break
+
+            time.sleep(wait_interval)
+            waited += wait_interval
+
+        if self._latest_frame is None:
+            # Process still running but no frames - kill it
+            self.stop()
+            raise Exception("No frames received from ffmpeg after 3 seconds")
+
+        self._initialized = True
+        logging.info(f"FFmpeg kmsgrab capture started: {width}x{height} @ 30fps")
+        return True
+
+    def _detect_resolution(self):
+        """Detect screen resolution."""
+        # Try kscreen-doctor (KDE Wayland)
+        try:
+            result = subprocess.run(['kscreen-doctor', '-o'], capture_output=True, text=True, timeout=1)
+            if result.returncode == 0:
+                for line in result.stdout.split('\n'):
+                    if 'Resolution:' in line:
+                        res = line.split(':')[1].strip()
+                        w, h = res.split('x')
+                        return int(w), int(h)
+        except:
+            pass
+
+        # Try wlr-randr (wlroots)
+        try:
+            result = subprocess.run(['wlr-randr'], capture_output=True, text=True, timeout=1)
+            if result.returncode == 0:
+                for line in result.stdout.split('\n'):
+                    if 'current' in line:
+                        parts = line.split()
+                        for part in parts:
+                            if 'x' in part and part[0].isdigit():
+                                w, h = part.split('x')
+                                return int(w), int(h.split('@')[0])
+        except:
+            pass
+
+        # Default to 1920x1080
+        logging.warning("Could not detect resolution, using 1920x1080")
+        return 1920, 1080
+
+    def _find_drm_device(self):
+        """Auto-detect the correct DRM device (card0, card1, etc.)."""
+        from pathlib import Path
+
+        # Check if /dev/dri exists
+        dri_path = Path('/dev/dri')
+        if not dri_path.exists():
+            logging.warning("/dev/dri not found, falling back to /dev/dri/card0")
+            return '/dev/dri/card0'
+
+        # Find all card devices
+        cards = sorted(dri_path.glob('card[0-9]*'))
+
+        if not cards:
+            logging.warning("No DRM card devices found, falling back to /dev/dri/card0")
+            return '/dev/dri/card0'
+
+        # Try to find a readable/writable card
+        for card in cards:
+            try:
+                # Check if we can read and write to this device
+                if os.access(str(card), os.R_OK | os.W_OK):
+                    logging.info(f"Found accessible DRM device: {card}")
+                    return str(card)
+            except Exception as e:
+                logging.debug(f"Cannot access {card}: {e}")
+                continue
+
+        # If no accessible card found, use the first one anyway
+        first_card = str(cards[0])
+        logging.warning(f"No accessible DRM cards found, trying {first_card} anyway")
+        return first_card
+
+    def _frame_reader(self):
+        """Background thread to continuously read frames from process stdout."""
+        logging.info("Frame reader thread started")
+        consecutive_failures = 0
+        max_consecutive_failures = 5
+
+        while not self._stop_event.is_set() and self.process:
+            try:
+                # Check if process is still running
+                if self.process.poll() is not None:
+                    logging.error(f"Capture process exited with code {self.process.returncode}")
+                    break
+
+                # Read one frame worth of data
+                frame_data = self.process.stdout.read(self.frame_size)
+
+                # Handle EOF or incomplete reads
+                if not frame_data:
+                    consecutive_failures += 1
+                    if consecutive_failures >= max_consecutive_failures:
+                        logging.error("Too many consecutive read failures (EOF), stopping frame reader")
+                        break
+                    logging.debug(f"Got EOF from capture process (attempt {consecutive_failures}/{max_consecutive_failures})")
+                    time.sleep(0.1)
+                    continue
+
+                if len(frame_data) != self.frame_size:
+                    consecutive_failures += 1
+                    if consecutive_failures >= max_consecutive_failures:
+                        logging.error(f"Too many incomplete frames, stopping. Got {len(frame_data)} bytes, expected {self.frame_size}")
+                        break
+                    # Only log occasionally to avoid spam
+                    if consecutive_failures == 1 or consecutive_failures % 10 == 0:
+                        logging.warning(f"Incomplete frame: got {len(frame_data)} bytes, expected {self.frame_size}")
+                    time.sleep(0.05)
+                    continue
+
+                # Successfully read a frame
+                consecutive_failures = 0
+
+                # Convert to PIL Image
+                img = Image.frombytes('RGB', (self.width, self.height), frame_data)
+
+                # Store latest frame
+                with self._frame_lock:
+                    self._latest_frame = img
+
+            except Exception as e:
+                if not self._stop_event.is_set():
+                    logging.error(f"Frame reader error: {e}")
+                break
+
+        logging.info("Frame reader thread stopped")
+
+    def capture_frame(self):
+        """
+        Get the latest captured frame.
+
+        Returns:
+            PIL.Image: Latest captured frame
+        """
+        if not self._initialized:
+            raise Exception("FFmpeg capture not initialized")
+
+        with self._frame_lock:
+            if self._latest_frame is None:
+                raise Exception("No frame available")
+            # Return a copy to avoid threading issues
+            return self._latest_frame.copy()
+
+    def stop(self):
+        """Stop FFmpeg/wl-screenrec capture."""
+        self._stop_event.set()
+
+        if self.process:
+            try:
+                self.process.terminate()
+                self.process.wait(timeout=2)
+            except:
+                try:
+                    self.process.kill()
+                except:
+                    pass
+            self.process = None
+
+        if self._reader_thread:
+            self._reader_thread.join(timeout=2)
+
+        self._initialized = False
+
+
+class PipeWirePortalCapture:
+    """Handles PipeWire screen capture via xdg-desktop-portal."""
+
+    def __init__(self):
+        """Initialize PipeWire portal capture."""
+        self.session_handle = None
+        self.pipewire_node = None
+        self.gst_pipeline = None
+        self.last_sample = None
+        self.sample_lock = Lock()
+        self._initialized = False
+        self.portal = None
+        self.sender_name = None
+
+    def initialize(self):
+        """Initialize portal session and PipeWire stream."""
+        if not PYDBUS_AVAILABLE or not GST_AVAILABLE:
+            raise Exception("pydbus and GStreamer required for PipeWire capture")
+
+        try:
+            logging.info("Initializing PipeWire portal capture (EXPERIMENTAL)...")
+            logging.warning("This capture method uses GStreamer pipewiresrc without full portal handshake")
+            logging.warning("It may not work reliably on KDE/Plasma - requires portal cooperation")
+
+            # Try multiple pipeline configurations
+            # NOTE: These are best-effort attempts without proper D-Bus portal negotiation
+            pipeline_configs = [
+                # Config 1: Try with specific path for screencasting
+                "pipewiresrc path=screen ! video/x-raw ! videoconvert ! video/x-raw,format=RGB ! appsink name=sink emit-signals=true sync=false max-buffers=1 drop=true",
+
+                # Config 2: Try default pipewiresrc (may pick up active screencast)
+                "pipewiresrc ! video/x-raw ! videoconvert ! video/x-raw,format=RGB ! appsink name=sink emit-signals=true sync=false max-buffers=1 drop=true",
+
+                # Config 3: Try with fd:// scheme (for portal integration)
+                "pipewiresrc fd=0 ! video/x-raw ! videoconvert ! video/x-raw,format=RGB ! appsink name=sink emit-signals=true sync=false max-buffers=1 drop=true",
+            ]
+
+            last_error = None
+            for idx, pipeline_str in enumerate(pipeline_configs):
+                try:
+                    logging.info(f"Trying PipeWire pipeline config {idx + 1}...")
+                    self.gst_pipeline = Gst.parse_launch(pipeline_str)
+                    appsink = self.gst_pipeline.get_by_name('sink')
+
+                    if appsink:
+                        appsink.connect('new-sample', self._on_new_sample)
+
+                    # Start the pipeline
+                    ret = self.gst_pipeline.set_state(Gst.State.PLAYING)
+                    if ret == Gst.StateChangeReturn.FAILURE:
+                        raise Exception("Failed to start GStreamer pipeline")
+
+                    # Wait a bit to see if we get a frame
+                    time.sleep(1.0)
+
+                    # Check if we got a sample
+                    with self.sample_lock:
+                        if self.last_sample:
+                            self._initialized = True
+                            logging.info(f"PipeWire capture initialized successfully with config {idx + 1}")
+                            return
+
+                    # Didn't work, try next config
+                    self.gst_pipeline.set_state(Gst.State.NULL)
+                    self.gst_pipeline = None
+
+                except Exception as e:
+                    last_error = e
+                    logging.warning(f"Pipeline config {idx + 1} failed: {e}")
+                    if self.gst_pipeline:
+                        try:
+                            self.gst_pipeline.set_state(Gst.State.NULL)
+                        except:
+                            pass
+                        self.gst_pipeline = None
+                    continue
+
+            # None of the configs worked
+            raise Exception(f"All PipeWire pipeline configs failed. Last error: {last_error}")
+
+        except Exception as e:
+            logging.error(f"Failed to initialize PipeWire capture: {e}")
+            logging.error("Make sure you have: sudo dnf install pipewire-gstreamer python3-gobject")
+            raise
+
+    def _on_new_sample(self, appsink):
+        """Callback when new frame is available."""
+        sample = appsink.emit('pull-sample')
+        if sample:
+            with self.sample_lock:
+                self.last_sample = sample
+        return Gst.FlowReturn.OK
+
+    def capture_frame(self):
+        """
+        Capture a frame from PipeWire stream.
+
+        Returns:
+            PIL.Image: Captured frame
+        """
+        if not self._initialized:
+            raise Exception("PipeWire capture not initialized")
+
+        with self.sample_lock:
+            if not self.last_sample:
+                raise Exception("No frame available yet")
+
+            sample = self.last_sample
+
+        # Extract frame data from GStreamer sample
+        buffer = sample.get_buffer()
+        caps = sample.get_caps()
+
+        # Get video info from caps
+        struct = caps.get_structure(0)
+        width = struct.get_value('width')
+        height = struct.get_value('height')
+
+        # Map buffer to read data
+        success, map_info = buffer.map(Gst.MapFlags.READ)
+        if not success:
+            raise Exception("Failed to map buffer")
+
+        try:
+            # Convert buffer data to PIL Image
+            img_data = bytes(map_info.data)
+            img = Image.frombytes('RGB', (width, height), img_data)
+            return img
+        finally:
+            buffer.unmap(map_info)
+
+    def stop(self):
+        """Stop PipeWire capture and clean up."""
+        if self.gst_pipeline:
+            self.gst_pipeline.set_state(Gst.State.NULL)
+            self.gst_pipeline = None
+        self._initialized = False
+
+
+class ThreadedFrameBuffer:
+    """Manages a pool of worker threads for parallel frame capture."""
+
+    def __init__(self, capture_func, num_workers=3, buffer_size=10):
+        """
+        Initialize threaded frame buffer.
+
+        Args:
+            capture_func: Function to call for capturing frames
+            num_workers: Number of parallel capture threads
+            buffer_size: Maximum number of frames to buffer
+        """
+        self.capture_func = capture_func
+        self.num_workers = num_workers
+        self.buffer_size = buffer_size
+        self.frame_queue = Queue(maxsize=buffer_size)
+        self.workers = []
+        self.stop_event = Event()
+        self._start_workers()
+
+    def _start_workers(self):
+        """Start worker threads."""
+        for i in range(self.num_workers):
+            worker = Thread(target=self._worker, args=(i,), daemon=True)
+            worker.start()
+            self.workers.append(worker)
+
+    def _worker(self, worker_id):
+        """Worker thread that continuously captures frames."""
+        logging.info(f"Frame capture worker {worker_id} started")
+        while not self.stop_event.is_set():
+            try:
+                # Capture a frame
+                frame_data = self.capture_func()
+                timestamp = time.time()
+
+                # Try to add to queue (non-blocking)
+                try:
+                    self.frame_queue.put((timestamp, frame_data), block=False)
+                except:
+                    # Queue full, drop oldest and try again
+                    try:
+                        self.frame_queue.get_nowait()
+                        self.frame_queue.put((timestamp, frame_data), block=False)
+                    except:
+                        pass
+
+            except Exception as e:
+                if not self.stop_event.is_set():
+                    logging.error(f"Worker {worker_id} capture error: {e}")
+                time.sleep(0.1)  # Brief pause on error
+
+    def get_frame(self, timeout=1.0):
+        """
+        Get the most recent frame from buffer.
+
+        Args:
+            timeout: Maximum time to wait for a frame
+
+        Returns:
+            Frame data or None if timeout
+        """
+        try:
+            # Get the most recent frame, discard older ones
+            timestamp, frame_data = self.frame_queue.get(timeout=timeout)
+
+            # Drain queue to get the absolute latest frame
+            while True:
+                try:
+                    timestamp, frame_data = self.frame_queue.get_nowait()
+                except Empty:
+                    break
+
+            return frame_data
+        except Empty:
+            return None
+
+    def stop(self):
+        """Stop all worker threads."""
+        self.stop_event.set()
+        for worker in self.workers:
+            worker.join(timeout=2.0)
+
+
+class ScreenCapture:
+    """Handles screen capture functionality."""
+
+    # Class-level lock for external screenshot tools (they don't handle concurrency well)
+    _tool_lock = Lock()
+
+    def __init__(self, monitor=0, quality=60, fps=30, force_method=None, use_threading=True,
+                 max_width=None, max_height=None, fast_encoding=True):
+        """
+        Initialize screen capture.
+
+        Args:
+            monitor: Monitor index to capture (0 for primary, -1 for all)
+            quality: JPEG quality (1-100, default 60 for better performance)
+            fps: Target frames per second
+            force_method: Force specific capture method ('auto', 'mss', 'pillow', 'pyvips', 'pipewire', 'wayland', or tool name)
+            use_threading: Use threaded frame buffer for slow capture methods
+            max_width: Maximum frame width (scales down if larger, None for no limit)
+            max_height: Maximum frame height (scales down if larger, None for no limit)
+            fast_encoding: Use fast JPEG encoding (simplejpeg) if available
+        """
+        self.capture_method = None  # 'mss', 'pillow', 'pyvips', 'pipewire', 'grim', 'spectacle', 'gnome-screenshot', or 'headless'
+        # Use thread-local storage for mss instances (mss uses thread-local display connections)
+        self._thread_local = local()
+        self._temp_dir = tempfile.mkdtemp(prefix='quickstream_')
+        self.pipewire_capture = None
+
+        self.monitor = monitor
+        self.quality = quality
+        self.fps = fps
+        self.frame_delay = 1.0 / fps
+        self._stop_event = Event()
+        self._frame_count = 0
+        self._last_fps_log = time.time()
+        self._fps_frame_count = 0
+        self.force_method = force_method
+        self.use_threading = use_threading
+        self.frame_buffer = None
+        self.max_width = max_width
+        self.max_height = max_height
+        self.fast_encoding = fast_encoding and SIMPLEJPEG_AVAILABLE
+
+        # Log encoding method
+        if self.fast_encoding:
+            logging.info("Using simplejpeg for fast JPEG encoding (3-6x faster than PIL)")
+        else:
+            logging.info("Using PIL for JPEG encoding (install simplejpeg for 3-6x speedup)")
+
+        # Detect best capture method
+        self._detect_capture_method()
+
+        # Enable threaded buffering for slow capture methods (not for PipeWire which is already fast)
+        # NOTE: External screenshot tools use a class-level lock for serialization, so we can't
+        # benefit from multiple workers - they would just wait on the lock. Use single worker.
+        if self.use_threading and self.capture_method in ('grim', 'spectacle', 'gnome-screenshot'):
+            num_workers = 1  # Single worker since tools use serialization lock
+            logging.info(f"Enabling threaded frame buffer with {num_workers} worker for {self.capture_method}")
+            logging.info(f"Note: {self.capture_method} requires serialized access, using single worker")
+            self.frame_buffer = ThreadedFrameBuffer(
+                capture_func=self._capture_frame_internal,
+                num_workers=num_workers,
+                buffer_size=10
+            )
+
+    def _detect_capture_method(self):
+        """Detect the best available screen capture method."""
+        # Handle forced method selection
+        if self.force_method == 'pipewire':
+            if self._try_pipewire():
+                return
+            logging.error("PipeWire not available, falling back to auto-detect")
+
+        elif self.force_method == 'pillow':
+            if self._try_pillow():
+                return
+            logging.error("Pillow ImageGrab not available, falling back to auto-detect")
+
+        elif self.force_method == 'pyvips':
+            if self._try_pyvips():
+                return
+            logging.error("pyvips not available, falling back to auto-detect")
+
+        elif self.force_method == 'mss':
+            if self._try_mss():
+                return
+            logging.error("mss not available, falling back to auto-detect")
+
+        elif self.force_method in ('spectacle', 'grim', 'gnome-screenshot'):
+            if self._try_tool([self.force_method, '--help'], self.force_method):
+                return
+            logging.error(f"{self.force_method} not available, falling back to auto-detect")
+
+        # Auto-detect best method
+        # Try mss first (works on X11, fastest)
+        if self._try_mss():
+            return
+
+        # Check if we're on Wayland - if so, try PipeWire first before fallback tools
+        if is_wayland():
+            logging.info("Wayland session detected")
+
+            # Try PipeWire capture first (experimental but potentially fast)
+            if self._try_pipewire():
+                return
+
+            logging.info("PipeWire not available, trying fallback screenshot tools...")
+
+            # Try screenshot tools in priority order
+            # grim (works on wlroots compositors)
+            if self._try_tool(['grim', '--help'], 'grim'):
+                return
+
+            # spectacle (KDE/Plasma)
+            if self._try_tool(['spectacle', '--help'], 'spectacle'):
+                return
+
+            # gnome-screenshot (GNOME)
+            if self._try_tool(['gnome-screenshot', '--help'], 'gnome-screenshot'):
+                return
+
+            logging.error("WAYLAND DETECTED - No compatible capture method found!")
+
+        # Try Pillow ImageGrab (works on some systems)
+        if self._try_pillow():
+            return
+
+        # Try pyvips (fast image processing)
+        if self._try_pyvips():
+            return
+
+        # Fallback to test pattern
+        self.capture_method = 'headless'
+        logging.warning("Running in HEADLESS mode with test pattern")
+
+    def _try_mss(self):
+        """Try to use mss for screen capture."""
+        try:
+            test_sct = mss.mss()
+            test_monitor = test_sct.monitors[1] if len(test_sct.monitors) > 1 else test_sct.monitors[0]
+            test_sct.grab(test_monitor)
+            test_sct.close()
+            self.capture_method = 'mss'
+            logging.info("Using mss for screen capture (X11)")
+            return True
+        except (mss.exception.ScreenShotError, Exception) as e:
+            logging.warning(f"mss not available: {e}")
+            return False
+
+    def _try_pillow(self):
+        """Try to use Pillow ImageGrab for screen capture."""
+        try:
+            from PIL import ImageGrab
+            # Test if it works
+            test_img = ImageGrab.grab()
+            if test_img:
+                self.capture_method = 'pillow'
+                logging.info("Using Pillow ImageGrab for screen capture")
+                return True
+        except Exception as e:
+            logging.warning(f"Pillow ImageGrab not available: {e}")
+        return False
+
+    def _try_pyvips(self):
+        """Try to use pyvips for screen capture."""
+        if not PYVIPS_AVAILABLE:
+            return False
+        try:
+            # Try to create a test screenshot using pyvips
+            # pyvips doesn't have built-in screen capture, so we use it with mss or Pillow
+            # We'll use it as a processing backend with Pillow ImageGrab
+            from PIL import ImageGrab
+            test_img = ImageGrab.grab()
+            if test_img:
+                # Convert PIL image to check if pyvips works
+                import numpy as np
+                test_array = np.array(test_img)
+                test_vips = pyvips.Image.new_from_array(test_array)
+                if test_vips:
+                    self.capture_method = 'pyvips'
+                    logging.info("Using pyvips with Pillow ImageGrab for screen capture")
+                    return True
+        except Exception as e:
+            logging.warning(f"pyvips not available: {e}")
+        return False
+
+    def _try_pipewire(self):
+        """Try to use PipeWire for screen capture."""
+        # First try FFmpeg/wl-screenrec based approach (doesn't require GStreamer)
+        try:
+            self.pipewire_capture = FFmpegPipeWireCapture()
+            self.pipewire_capture.initialize()
+
+            # Test capture a frame to ensure it works
+            test_frame = self.pipewire_capture.capture_frame()
+
+            if test_frame:
+                self.capture_method = 'pipewire'
+                logging.info("Using FFmpeg/wl-screenrec for screen capture (Wayland - Real-time)")
+                return True
+
+        except Exception as e:
+            logging.warning(f"FFmpeg/wl-screenrec not available: {e}")
+            if self.pipewire_capture:
+                try:
+                    self.pipewire_capture.stop()
+                except:
+                    pass
+                self.pipewire_capture = None
+
+        # Try GStreamer-based approach as fallback
+        if PYDBUS_AVAILABLE and GST_AVAILABLE:
+            try:
+                # Initialize PipeWire capture
+                self.pipewire_capture = PipeWirePortalCapture()
+                self.pipewire_capture.initialize()
+
+                # Test capture a frame to ensure it works
+                test_frame = self.pipewire_capture.capture_frame()
+
+                if test_frame:
+                    self.capture_method = 'pipewire'
+                    logging.info("Using GStreamer PipeWire for screen capture (Wayland - Fast, Real-time)")
+                    return True
+
+            except Exception as e:
+                logging.warning(f"GStreamer PipeWire not available: {e}")
+                if self.pipewire_capture:
+                    try:
+                        self.pipewire_capture.stop()
+                    except:
+                        pass
+                    self.pipewire_capture = None
+
+        logging.warning("PipeWire capture not available.")
+        return False
+
+    def _try_tool(self, test_cmd, tool_name):
+        """Try if a screenshot tool is available."""
+        try:
+            result = subprocess.run(test_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=1)
+            if result.returncode != 0:
+                return False
+            self.capture_method = tool_name
+            logging.info(f"Using {tool_name} for screen capture (Wayland)")
+            logging.warning(f"Performance note: {tool_name} is a screenshot tool, NOT designed for streaming!")
+            logging.warning(f"Expect only 1-5 FPS max. For better performance, use X11 session or install PipeWire capture.")
+            return True
+        except (subprocess.TimeoutExpired, FileNotFoundError, Exception):
+            return False
+
+    def _get_sct(self):
+        """Get or create thread-local mss instance."""
+        if self.capture_method != 'mss':
+            return None
+
+        if not hasattr(self._thread_local, 'sct'):
+            self._thread_local.sct = mss.mss()
+        return self._thread_local.sct
+
+    def get_monitor(self):
+        """Get the monitor to capture (for mss)."""
+        if self.capture_method != 'mss':
+            return None
+
+        sct = self._get_sct()
+        if self.monitor == -1:
+            # Capture all monitors
+            return sct.monitors[0]
+        elif 0 <= self.monitor < len(sct.monitors) - 1:
+            # Capture specific monitor (monitors[0] is all, monitors[1+] are individual)
+            return sct.monitors[self.monitor + 1]
+        else:
+            # Default to primary monitor
+            return sct.monitors[1]
+
+    def _get_screen_info(self):
+        """Get screen resolution and DPI scaling info."""
+        if IS_WINDOWS:
+            try:
+                import ctypes
+                # Make process DPI aware
+                try:
+                    ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PROCESS_PER_MONITOR_DPI_AWARE
+                except:
+                    pass
+
+                # Get screen dimensions
+                user32 = ctypes.windll.user32
+                screen_width = user32.GetSystemMetrics(0)  # SM_CXSCREEN
+                screen_height = user32.GetSystemMetrics(1)  # SM_CYSCREEN
+
+                return {
+                    'width': screen_width,
+                    'height': screen_height,
+                    'dpi_aware': True
+                }
+            except:
+                pass
+        else:
+            # Linux: Get screen info from xdpyinfo or xrandr
+            try:
+                result = subprocess.run(
+                    ['xdpyinfo'],
+                    capture_output=True,
+                    text=True,
+                    timeout=0.5
+                )
+                if result.returncode == 0:
+                    for line in result.stdout.split('\n'):
+                        if 'dimensions:' in line:
+                            # Parse: "  dimensions:    1920x1080 pixels (508x285 millimeters)"
+                            parts = line.split()
+                            if len(parts) >= 2:
+                                dims = parts[1].split('x')
+                                if len(dims) == 2:
+                                    return {
+                                        'width': int(dims[0]),
+                                        'height': int(dims[1]),
+                                        'dpi_aware': False
+                                    }
+            except:
+                pass
+        return None
+
+    def _get_cursor_position(self):
+        """Get cursor position (Windows or Linux X11)."""
+        # Windows: Use ctypes to get cursor position
+        if IS_WINDOWS:
+            try:
+                import ctypes
+                # Make process DPI aware
+                try:
+                    ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PROCESS_PER_MONITOR_DPI_AWARE
+                except:
+                    pass
+
+                class POINT(ctypes.Structure):
+                    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+                point = POINT()
+                ctypes.windll.user32.GetCursorPos(ctypes.byref(point))
+                return point.x, point.y
+            except:
+                pass
+
+        # Linux X11: Use xdotool
+        else:
+            try:
+                result = subprocess.run(
+                    ['xdotool', 'getmouselocation', '--shell'],
+                    capture_output=True,
+                    text=True,
+                    timeout=0.1
+                )
+                if result.returncode == 0:
+                    lines = result.stdout.strip().split('\n')
+                    pos = {}
+                    for line in lines:
+                        if '=' in line:
+                            key, value = line.split('=', 1)
+                            pos[key] = int(value)
+                    return pos.get('X', 0), pos.get('Y', 0)
+            except:
+                pass
+
+        return None
+
+    def _draw_cursor(self, img, x, y):
+        """Draw a simple cursor on the image."""
+        draw = ImageDraw.Draw(img)
+        # Draw a simple arrow cursor
+        cursor_size = 20
+        # Arrow points
+        points = [
+            (x, y),
+            (x, y + cursor_size),
+            (x + cursor_size//3, y + cursor_size*2//3),
+            (x + cursor_size*2//3, y + cursor_size//3)
+        ]
+        # Draw cursor with black outline
+        draw.polygon(points, fill='white', outline='black')
+
+    def _capture_with_mss(self):
+        """Capture screen using mss library."""
+        sct = self._get_sct()
+        monitor = self.get_monitor()
+        screenshot = sct.grab(monitor)
+        img = Image.frombytes('RGB', screenshot.size, screenshot.rgb)
+
+        # Try to add cursor overlay
+        cursor_pos = self._get_cursor_position()
+        if cursor_pos:
+            x, y = cursor_pos
+            # Adjust coordinates relative to monitor
+            monitor_left = monitor.get('left', 0)
+            monitor_top = monitor.get('top', 0)
+            rel_x = x - monitor_left
+            rel_y = y - monitor_top
+            if 0 <= rel_x < img.width and 0 <= rel_y < img.height:
+                self._draw_cursor(img, rel_x, rel_y)
+
+        return img
+
+    def _capture_with_tool(self, tool_name):
+        """Capture screen using external tool (grim, spectacle, gnome-screenshot)."""
+        # Use lock to serialize tool calls (they don't handle concurrent execution well)
+        with self._tool_lock:
+            temp_file = os.path.join(self._temp_dir, f'screenshot_{time.time()}.png')
+
+            try:
+                # Longer timeout since we use parallel workers
+                timeout = 2.0  # 2 seconds max per capture
+
+                if tool_name == 'grim':
+                    # -c includes cursor
+                    subprocess.run(['grim', '-c', temp_file], check=True, timeout=timeout,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                elif tool_name == 'spectacle':
+                    # -b is background mode, -p includes pointer/cursor, -n is no notify, -o is output
+                    # NOTE: Flags must be separate, not combined!
+                    subprocess.run(['spectacle', '-b', '-p', '-n', '-o', temp_file], check=True, timeout=timeout,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                elif tool_name == 'gnome-screenshot':
+                    # -p includes pointer, -f is file output
+                    subprocess.run(['gnome-screenshot', '-p', '-f', temp_file], check=True, timeout=timeout,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+                # Load the screenshot
+                if os.path.exists(temp_file):
+                    img = Image.open(temp_file)
+                    # Convert to RGB if needed
+                    if img.mode != 'RGB':
+                        img = img.convert('RGB')
+                    # Clean up
+                    try:
+                        os.remove(temp_file)
+                    except:
+                        pass
+                    return img
+                else:
+                    raise Exception(f"Screenshot file not created by {tool_name}")
+
+            except Exception as e:
+                logging.error(f"Error capturing with {tool_name}: {e}")
+                raise
+
+    def generate_test_pattern(self):
+        """
+        Generate a test pattern frame for headless/demo mode.
+
+        Returns:
+            PIL.Image: Test pattern image
+        """
+        # Create a 1280x720 test pattern
+        width, height = 1280, 720
+        img = Image.new('RGB', (width, height), color='#1a1a1a')
+        draw = ImageDraw.Draw(img)
+
+        # Draw colored bars
+        colors = ['#e74c3c', '#3498db', '#2ecc71', '#f39c12', '#9b59b6', '#1abc9c']
+        bar_width = width // len(colors)
+        for i, color in enumerate(colors):
+            x0 = i * bar_width
+            x1 = (i + 1) * bar_width if i < len(colors) - 1 else width
+            draw.rectangle([x0, 0, x1, height // 3], fill=color)
+
+        # Draw frame counter
+        self._frame_count += 1
+        text = f"QuickStream - HEADLESS MODE\nFrame: {self._frame_count}\nTest Pattern"
+
+        # Try to use default font, fall back to basic if not available
+        try:
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 32)
+        except:
+            font = ImageFont.load_default()
+
+        # Draw text with shadow
+        text_x, text_y = width // 2 - 200, height // 2
+        draw.text((text_x + 2, text_y + 2), text, fill='#000000', font=font)
+        draw.text((text_x, text_y), text, fill='#ffffff', font=font)
+
+        # Draw timestamp
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        draw.text((20, height - 60), timestamp, fill='#ffffff', font=font)
+
+        return img
+
+    def _capture_with_pillow(self):
+        """Capture screen using Pillow ImageGrab."""
+        from PIL import ImageGrab
+        img = ImageGrab.grab()
+        # Convert to RGB if needed
+        if img.mode != 'RGB':
+            img = img.convert('RGB')
+
+        # Try to add cursor overlay with proper scaling
+        cursor_pos = self._get_cursor_position()
+        screen_info = self._get_screen_info()
+
+        if cursor_pos and screen_info:
+            cursor_x, cursor_y = cursor_pos
+            screen_width = screen_info['width']
+            screen_height = screen_info['height']
+
+            # Calculate relative position (0.0 to 1.0)
+            rel_x = cursor_x / screen_width
+            rel_y = cursor_y / screen_height
+
+            # Map to captured image size
+            img_x = int(rel_x * img.width)
+            img_y = int(rel_y * img.height)
+
+            # Draw cursor if within bounds
+            if 0 <= img_x < img.width and 0 <= img_y < img.height:
+                self._draw_cursor(img, img_x, img_y)
+        elif cursor_pos:
+            # Fallback: assume cursor coords match image coords
+            x, y = cursor_pos
+            if 0 <= x < img.width and 0 <= y < img.height:
+                self._draw_cursor(img, x, y)
+
+        return img
+
+    def _capture_with_pyvips(self):
+        """Capture screen using pyvips with Pillow ImageGrab."""
+        from PIL import ImageGrab
+        try:
+            import numpy as np
+        except ImportError:
+            raise Exception("numpy is required for pyvips capture path. Install with: pip install numpy")
+
+        # Capture using Pillow
+        pil_img = ImageGrab.grab()
+
+        # Convert to numpy array
+        img_array = np.array(pil_img)
+
+        # Create pyvips image from numpy array
+        vips_img = pyvips.Image.new_from_array(img_array)
+
+        # Convert back to PIL for consistency with other methods
+        # This allows us to use pyvips processing if needed in the future
+        height, width = vips_img.height, vips_img.width
+        img_data = vips_img.write_to_memory()
+
+        # Convert back to PIL Image
+        img = Image.frombytes('RGB', (width, height), img_data)
+
+        # Try to add cursor overlay with proper scaling
+        cursor_pos = self._get_cursor_position()
+        screen_info = self._get_screen_info()
+
+        if cursor_pos and screen_info:
+            cursor_x, cursor_y = cursor_pos
+            screen_width = screen_info['width']
+            screen_height = screen_info['height']
+
+            # Calculate relative position (0.0 to 1.0)
+            rel_x = cursor_x / screen_width
+            rel_y = cursor_y / screen_height
+
+            # Map to captured image size
+            img_x = int(rel_x * img.width)
+            img_y = int(rel_y * img.height)
+
+            # Draw cursor if within bounds
+            if 0 <= img_x < img.width and 0 <= img_y < img.height:
+                self._draw_cursor(img, img_x, img_y)
+        elif cursor_pos:
+            # Fallback: assume cursor coords match image coords
+            x, y = cursor_pos
+            if 0 <= x < img.width and 0 <= y < img.height:
+                self._draw_cursor(img, x, y)
+
+        return img
+
+    def _capture_with_pipewire(self):
+        """Capture screen using PipeWire portal."""
+        if not self.pipewire_capture:
+            raise Exception("PipeWire capture not initialized")
+
+        img = self.pipewire_capture.capture_frame()
+        # Convert to RGB if needed
+        if img.mode != 'RGB':
+            img = img.convert('RGB')
+        return img
+
+    def _scale_image_if_needed(self, img):
+        """
+        Scale image down if it exceeds max_width or max_height.
+
+        Args:
+            img: PIL Image
+
+        Returns:
+            PIL.Image: Scaled image (or original if no scaling needed)
+        """
+        if not self.max_width and not self.max_height:
+            return img
+
+        width, height = img.size
+        needs_scaling = False
+        scale_factor = 1.0
+
+        if self.max_width and width > self.max_width:
+            scale_factor = min(scale_factor, self.max_width / width)
+            needs_scaling = True
+
+        if self.max_height and height > self.max_height:
+            scale_factor = min(scale_factor, self.max_height / height)
+            needs_scaling = True
+
+        if needs_scaling:
+            new_width = int(width * scale_factor)
+            new_height = int(height * scale_factor)
+            # Use BILINEAR for speed (LANCZOS is slower but higher quality)
+            img = img.resize((new_width, new_height), Image.BILINEAR)
+            logging.debug(f"Scaled frame: {width}x{height} -> {new_width}x{new_height} ({scale_factor:.2f}x)")
+
+        return img
+
+    def _encode_jpeg_fast(self, img):
+        """
+        Encode image as JPEG using fast encoder (simplejpeg) if available.
+
+        Args:
+            img: PIL Image
+
+        Returns:
+            bytes: JPEG encoded data
+        """
+        if self.fast_encoding:
+            # Use simplejpeg (3-6x faster than PIL)
+            # Convert PIL Image to numpy array
+            img_array = np.array(img)
+
+            # simplejpeg expects RGB format
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
+                img_array = np.array(img)
+
+            # Encode with simplejpeg
+            jpeg_data = simplejpeg.encode_jpeg(
+                img_array,
+                quality=self.quality,
+                colorspace='RGB',
+                fastdct=True  # Use fast DCT (slightly lower quality but much faster)
+            )
+            return jpeg_data
+        else:
+            # Fallback to PIL (slower)
+            buffer = io.BytesIO()
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
+            img.save(buffer, format='JPEG', quality=self.quality, optimize=False)
+            return buffer.getvalue()
+
+    def _capture_frame_internal(self):
+        """
+        Internal method to capture a raw frame (PIL Image).
+        Used by both direct capture and threaded buffer workers.
+
+        Returns:
+            PIL.Image: Captured image
+        """
+        if self.capture_method == 'headless':
+            return self.generate_test_pattern()
+        elif self.capture_method == 'mss':
+            return self._capture_with_mss()
+        elif self.capture_method == 'pillow':
+            return self._capture_with_pillow()
+        elif self.capture_method == 'pyvips':
+            return self._capture_with_pyvips()
+        elif self.capture_method == 'pipewire':
+            return self._capture_with_pipewire()
+        elif self.capture_method in ('grim', 'spectacle', 'gnome-screenshot'):
+            return self._capture_with_tool(self.capture_method)
+        else:
+            return self.generate_test_pattern()
+
+    def capture_frame(self):
+        """
+        Capture and encode a frame.
+        Uses threaded buffer if available, otherwise captures directly.
+
+        Returns:
+            bytes: JPEG encoded frame
+        """
+        frame_start = time.time()
+
+        # Get frame from buffer or capture directly
+        if self.frame_buffer:
+            img = self.frame_buffer.get_frame(timeout=2.0)
+            if img is None:
+                # Fallback to direct capture if buffer timeout
+                logging.warning("Frame buffer timeout, falling back to direct capture")
+                img = self._capture_frame_internal()
+        else:
+            img = self._capture_frame_internal()
+
+        # Scale image if needed (before encoding for better performance)
+        scale_start = time.time()
+        img = self._scale_image_if_needed(img)
+        scale_time = time.time() - scale_start
+
+        # Encode as JPEG using fast encoder
+        encode_start = time.time()
+        jpeg_data = self._encode_jpeg_fast(img)
+        encode_time = time.time() - encode_start
+
+        total_time = time.time() - frame_start
+
+        # Track FPS
+        self._fps_frame_count += 1
+        time_since_last_log = time.time() - self._last_fps_log
+        if time_since_last_log >= 5.0:  # Log every 5 seconds
+            actual_fps = self._fps_frame_count / time_since_last_log
+            avg_frame_time = (time_since_last_log/self._fps_frame_count)*1000
+            logging.info(
+                f"Performance: {actual_fps:.1f} FPS (target: {self.fps}), "
+                f"avg frame time: {avg_frame_time:.1f}ms, "
+                f"encode: {encode_time*1000:.1f}ms, "
+                f"size: {len(jpeg_data)/1024:.1f}KB"
+            )
+            self._last_fps_log = time.time()
+            self._fps_frame_count = 0
+
+        # Log performance if frame takes longer than target (only for non-buffered)
+        if not self.frame_buffer and total_time > self.frame_delay * 1.5:
+            capture_time = total_time - encode_time - scale_time
+            logging.warning(
+                f"Frame slow: {total_time*1000:.1f}ms (target: {self.frame_delay*1000:.1f}ms) "
+                f"- capture: {capture_time*1000:.1f}ms, scale: {scale_time*1000:.1f}ms, "
+                f"encode: {encode_time*1000:.1f}ms"
+            )
+
+        return jpeg_data
+
+    def generate_frames(self):
+        """
+        Generator that yields frames for MJPEG streaming.
+
+        Yields:
+            bytes: MJPEG frame with multipart headers
+        """
+        while not self._stop_event.is_set():
+            start_time = time.time()
+
+            try:
+                frame = self.capture_frame()
+                yield (b'--frame\r\n'
+                       b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+            except Exception as e:
+                logging.error(f"Error capturing frame: {e}")
+                continue
+
+            # Maintain target FPS
+            elapsed = time.time() - start_time
+            sleep_time = max(0, self.frame_delay - elapsed)
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+
+    def stop(self):
+        """Stop the screen capture."""
+        self._stop_event.set()
+
+        # Stop frame buffer if active
+        if self.frame_buffer:
+            logging.info("Stopping frame buffer workers...")
+            self.frame_buffer.stop()
+
+        # Stop PipeWire capture if active
+        if self.pipewire_capture:
+            logging.info("Stopping PipeWire capture...")
+            try:
+                self.pipewire_capture.stop()
+            except Exception as e:
+                logging.warning(f"Error stopping PipeWire capture: {e}")
+            self.pipewire_capture = None
+
+        # Thread-local mss instances will be cleaned up when threads terminate
+
+        # Clean up temporary directory
+        try:
+            import shutil
+            if os.path.exists(self._temp_dir):
+                shutil.rmtree(self._temp_dir)
+        except Exception as e:
+            logging.warning(f"Failed to clean up temp directory: {e}")
+
+
+class Config:
+    """Handles configuration loading and validation."""
+
+    DEFAULT_CONFIG = {
+        'process_name': 'quickstream',
+        'host': '0.0.0.0',
+        'port': 5000,
+        'quality': 60,  # Lowered from 75 for better performance
+        'fps': 30,
+        'monitor': 0,
+        'max_width': 1920,  # Scale down to 1920 if larger
+        'max_height': 1080,  # Scale down to 1080 if larger
+        'fast_encoding': True  # Use fast JPEG encoding if available
+    }
+
+    def __init__(self, config_path='config.ini'):
+        """
+        Load configuration from file.
+
+        Args:
+            config_path: Path to configuration file
+        """
+        self.config_path = Path(config_path)
+        self.config = self.DEFAULT_CONFIG.copy()
+        self.load()
+
+    def load(self):
+        """Load configuration from INI file."""
+        if not self.config_path.exists():
+            logging.warning(f"Config file not found: {self.config_path}, using defaults")
+            return
+
+        parser = configparser.ConfigParser()
+        try:
+            parser.read(self.config_path)
+
+            if 'server' in parser:
+                server_config = parser['server']
+                self.config['process_name'] = server_config.get('process_name', self.config['process_name'])
+                self.config['host'] = server_config.get('host', self.config['host'])
+                self.config['port'] = server_config.getint('port', self.config['port'])
+                self.config['quality'] = server_config.getint('quality', self.config['quality'])
+                self.config['fps'] = server_config.getint('fps', self.config['fps'])
+                self.config['monitor'] = server_config.getint('monitor', self.config['monitor'])
+                self.config['max_width'] = server_config.getint('max_width', self.config['max_width'])
+                self.config['max_height'] = server_config.getint('max_height', self.config['max_height'])
+                self.config['fast_encoding'] = server_config.getboolean('fast_encoding', self.config['fast_encoding'])
+
+            logging.info(f"Configuration loaded from {self.config_path}")
+        except Exception as e:
+            logging.error(f"Error loading config: {e}, using defaults")
+
+    def get(self, key, default=None):
+        """Get configuration value."""
+        return self.config.get(key, default)
+
+
+# HTML template for the viewer
+VIEWER_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>QuickStream Viewer</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            background-color: #1a1a1a;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+            font-family: Arial, sans-serif;
+            color: #fff;
+        }
+        h1 {
+            margin: 20px;
+            font-size: 24px;
+        }
+        #stream-container {
+            position: relative;
+            max-width: 95vw;
+            max-height: 90vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+        #stream {
+            max-width: 100%;
+            max-height: 90vh;
+            border: 2px solid #333;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
+            cursor: pointer;
+        }
+        .info {
+            margin: 10px;
+            font-size: 14px;
+            color: #888;
+        }
+        .status {
+            position: fixed;
+            top: 10px;
+            right: 10px;
+            padding: 8px 16px;
+            background-color: #28a745;
+            border-radius: 4px;
+            font-size: 12px;
+            z-index: 1000;
+        }
+        .status.disconnected {
+            background-color: #dc3545;
+        }
+        .fullscreen-btn {
+            position: absolute;
+            bottom: 20px;
+            right: 20px;
+            padding: 10px 20px;
+            background-color: rgba(52, 152, 219, 0.9);
+            color: white;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: bold;
+            box-shadow: 0 2px 5px rgba(0, 0, 0, 0.3);
+            transition: background-color 0.3s, transform 0.1s;
+            z-index: 100;
+        }
+        .fullscreen-btn:hover {
+            background-color: rgba(41, 128, 185, 1);
+            transform: scale(1.05);
+        }
+        .fullscreen-btn:active {
+            transform: scale(0.95);
+        }
+        /* Fullscreen styles */
+        #stream-container:fullscreen {
+            background-color: #000;
+            max-width: 100vw;
+            max-height: 100vh;
+        }
+        #stream-container:fullscreen #stream {
+            max-width: 100vw;
+            max-height: 100vh;
+            border: none;
+        }
+        #stream-container:-webkit-full-screen {
+            background-color: #000;
+            max-width: 100vw;
+            max-height: 100vh;
+        }
+        #stream-container:-webkit-full-screen #stream {
+            max-width: 100vw;
+            max-height: 100vh;
+            border: none;
+        }
+    </style>
+</head>
+<body>
+    <div class="status" id="status">Connected</div>
+    <h1>QuickStream</h1>
+    <div id="stream-container">
+        <img id="stream" src="/video_feed" alt="Stream">
+        <button class="fullscreen-btn" id="fullscreen-btn" title="Toggle fullscreen (or double-click stream)">
+            Fullscreen
+        </button>
+    </div>
+    <div class="info">Simple LAN Screen Streaming - Double-click or use fullscreen button</div>
+
+    <script>
+        const img = document.getElementById('stream');
+        const status = document.getElementById('status');
+        const streamContainer = document.getElementById('stream-container');
+        const fullscreenBtn = document.getElementById('fullscreen-btn');
+
+        // Monitor connection status
+        img.addEventListener('error', function() {
+            status.textContent = 'Disconnected';
+            status.classList.add('disconnected');
+
+            // Try to reconnect after 2 seconds
+            setTimeout(function() {
+                img.src = '/video_feed?' + new Date().getTime();
+            }, 2000);
+        });
+
+        img.addEventListener('load', function() {
+            status.textContent = 'Connected';
+            status.classList.remove('disconnected');
+        });
+
+        // Fullscreen functionality
+        function toggleFullscreen() {
+            if (!document.fullscreenElement && !document.webkitFullscreenElement) {
+                // Enter fullscreen
+                if (streamContainer.requestFullscreen) {
+                    streamContainer.requestFullscreen();
+                } else if (streamContainer.webkitRequestFullscreen) {
+                    streamContainer.webkitRequestFullscreen();
+                }
+            } else {
+                // Exit fullscreen
+                if (document.exitFullscreen) {
+                    document.exitFullscreen();
+                } else if (document.webkitExitFullscreen) {
+                    document.webkitExitFullscreen();
+                }
+            }
+        }
+
+        // Fullscreen button click
+        fullscreenBtn.addEventListener('click', function(e) {
+            e.stopPropagation();
+            toggleFullscreen();
+        });
+
+        // Double-click on stream to toggle fullscreen
+        img.addEventListener('dblclick', toggleFullscreen);
+
+        // Update button text when fullscreen changes
+        document.addEventListener('fullscreenchange', updateFullscreenButton);
+        document.addEventListener('webkitfullscreenchange', updateFullscreenButton);
+
+        function updateFullscreenButton() {
+            if (document.fullscreenElement || document.webkitFullscreenElement) {
+                fullscreenBtn.textContent = 'Exit Fullscreen';
+            } else {
+                fullscreenBtn.textContent = 'Fullscreen';
+            }
+        }
+    </script>
+</body>
+</html>
+"""
+
+
+def create_app(config, force_method=None):
+    """
+    Create and configure the Flask application.
+
+    Args:
+        config: Config object
+        force_method: Optional forced capture method
+
+    Returns:
+        Flask app instance
+    """
+    app = Flask(__name__)
+
+    # Initialize screen capture
+    screen_capture = ScreenCapture(
+        monitor=config.get('monitor'),
+        quality=config.get('quality'),
+        fps=config.get('fps'),
+        force_method=force_method,
+        max_width=config.get('max_width'),
+        max_height=config.get('max_height'),
+        fast_encoding=config.get('fast_encoding')
+    )
+
+    @app.route('/')
+    def index():
+        """Serve the viewer page."""
+        return render_template_string(VIEWER_TEMPLATE)
+
+    @app.route('/video_feed')
+    def video_feed():
+        """Video streaming route."""
+        return Response(
+            screen_capture.generate_frames(),
+            mimetype='multipart/x-mixed-replace; boundary=frame'
+        )
+
+    @app.route('/health')
+    def health():
+        """Health check endpoint."""
+        return {'status': 'ok', 'service': 'quickstream'}
+
+    # Store screen_capture for cleanup
+    app.screen_capture = screen_capture
+
+    return app
+
+
+def main():
+    """Main entry point - auto-start with Pillow ImageGrab and hide window."""
+    # Setup logging (minimal output since we're hiding the window)
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s'
+    )
+
+    # Load configuration
+    config = Config('config.ini')
+    port = config.get('port')
+
+    # Show startup info with IP address for 5 seconds
+    show_startup_info(port, display_time=5)
+
+    # Hide the console window completely
+    hide_console_window()
+
+    # Set process name
+    process_name = config.get('process_name')
+    if setproctitle:
+        setproctitle.setproctitle(process_name)
+
+    # Create Flask app with Pillow ImageGrab (option 4)
+    # Force 'pillow' method
+    app = create_app(config, force_method='pillow')
+
+    # Get server configuration
+    host = config.get('host')
+
+    try:
+        # Run the Flask app (this runs in the background with hidden window)
+        app.run(
+            host=host,
+            port=port,
+            debug=False,
+            threaded=True
+        )
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if hasattr(app, 'screen_capture'):
+            app.screen_capture.stop()
+
+
+if __name__ == '__main__':
+    main()
