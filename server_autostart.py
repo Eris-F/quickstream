@@ -107,14 +107,34 @@ def hide_console_window():
     if IS_WINDOWS:
         try:
             import ctypes
+            from ctypes import wintypes
+
             # Get the console window handle
             kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
             user32 = ctypes.WinDLL('user32', use_last_error=True)
 
+            # Constants
+            SW_HIDE = 0
+            GWL_EXSTYLE = -20
+            WS_EX_APPWINDOW = 0x00040000
+            WS_EX_TOOLWINDOW = 0x00000080
+
             hwnd = kernel32.GetConsoleWindow()
             if hwnd:
-                # SW_HIDE = 0 (completely hides the window)
-                user32.ShowWindow(hwnd, 0)
+                # Method 1: Remove from taskbar by changing extended window style
+                # Get current extended style
+                user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
+                user32.GetWindowLongW.restype = ctypes.c_long
+                user32.SetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_long]
+                user32.SetWindowLongW.restype = ctypes.c_long
+
+                ex_style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+                # Remove WS_EX_APPWINDOW (shows in taskbar) and add WS_EX_TOOLWINDOW (hides from taskbar)
+                new_style = (ex_style & ~WS_EX_APPWINDOW) | WS_EX_TOOLWINDOW
+                user32.SetWindowLongW(hwnd, GWL_EXSTYLE, new_style)
+
+                # Method 2: Hide the window completely
+                user32.ShowWindow(hwnd, SW_HIDE)
                 return True
         except Exception as e:
             logging.warning(f"Could not hide console window: {e}")
